@@ -1,45 +1,60 @@
-"""Media ``data:``/``blob:`` URI carve-out — behaviour.
+"""Inline-media ``data:`` URI carve-out — behaviour and its CSP gate.
 
-A widget emits ``<img src="data:image/webp;base64,…">``. The base64 body is a
-rendered sub-resource (it never fetches, never egresses — the widget CSP is
-``img-src data: blob:`` with a documented "NEVER fetches" contract) but is
+An MCP app emits ``<img src="data:image/webp;base64,…">``. The base64 body is a
+rendered sub-resource (the browser decodes it and issues no request) but is
 structurally identical to an encoded secret, so before this carve-out the
 credential and exfil passes spliced a ``[REDACTED: credential]`` tag INTO the
 ``src`` and stranded the image.
 
-The carve-out is default-deny and surface-scoped. The two bare passes
-``redact_credentials`` / ``redact_exfiltration_urls`` carry NO media awareness —
-every direct caller scans inline media in full. Only the composed facade helper
-``redact_rendered_assistant_text`` masks media around both passes, and only the
-dashboard's browser-rendered assistant-text sites (via ``_redact_leaves`` in
-``mcp_apps_render.py``) reach it. So the behavioural "survives byte-identical /
-is exempt" tests below target the FACADE, while the inverse tests assert the
-bare passes still REDACT a media URI.
+The carve-out is default-deny and bounded twice over:
 
-``_mask_media_data_uris`` (in ``security/redaction.py``) masks such URIs to an
-inert placeholder before the passes run and restores them after. The carve-out
-lives on the one surface that renders inline media — the backend.
+1. **Surface-scoped.** The two bare passes ``redact_credentials`` /
+   ``redact_exfiltration_urls`` carry NO media awareness — every direct caller
+   scans inline media in full. Only the composed facade helper
+   ``redact_mcp_app_payload_text`` masks media around both passes. So the
+   "survives byte-identical" tests target the FACADE, while
+   :class:`TestBarePassesAreMediaUnaware` asserts the bare passes still REDACT a
+   media URI.
+2. **CSP-gated per payload.** An MCP-app iframe is NOT egress-free: the app's own
+   ``connectDomains`` replace ``connect-src 'none'`` in ``buildMcpAppCsp``, and
+   the app's JS and its CSP metadata share one author. So
+   ``mcp_apps_render._payload_redactor`` hands the carve-out to a payload ONLY
+   when its declared CSP grants no outbound origin, and the strict pass otherwise
+   — pinned in :class:`TestCspGate`.
 
-The scope is deliberately MEDIA-ONLY: an ``image/`` or ``font/`` ``data:`` URI
-and a ``blob:`` URL are exempt; a ``data:text/…`` blob is still scanned, so it
-cannot become a smuggling channel. Widening the MIME scope to ``text``/
-``application`` would open exactly that, and these tests fail if it does.
+The MIME scope is deliberately MEDIA-ONLY: an ``image/`` or ``font/`` ``data:``
+URI is eligible; a ``data:text/…`` blob is still scanned, so it cannot become a
+smuggling channel. Widening the MIME scope to ``text``/``application`` would open
+exactly that, and these tests fail if it does. ``blob:`` is out of scope
+entirely: the consuming iframe's ``img-src 'self' data:`` cannot render one.
 """
 
 from __future__ import annotations
 
+import base64
 import re
+from pathlib import Path
 
+import pytest
+
+from kiro_crew.mcp_apps_render import (
+    _CSP_EGRESS_KEYS,
+    _csp_grants_egress,
+    _payload_redactor,
+    _redact_leaves,
+)
 from kiro_crew.security import (
     _mask_media_data_uris,
+    _media_body_is_clean,
     _unmask_media_data_uris,
     redact_credentials,
     redact_exfiltration_urls,
-    redact_rendered_assistant_text,
+    redact_mcp_app_payload_text,
 )
 
 # The scope primitives stay OFF the security facade — like ``_MEDIA_DATA_URI_RE``,
 # they are imported from their owning module by tests.
+from kiro_crew.security import redaction
 from kiro_crew.security.redaction import (
     _MEDIA_DATA_URI_RE,
     _MEDIA_URI_PREFIX_RE,
@@ -55,8 +70,14 @@ _JWS = (
 )
 
 # A long, plausible webp base64 body (no dots, so not a JWT itself) — the 40+
-# base64-char run that trips the base64/entropy heuristics.
-_WEBP_BODY = "UklGRhIAAABXRUJQVlA4TAYAAAAvAAAAAAfQ//73v/+BiOh/AAA=" + "A" * 80
+# base64-char run that trips the base64/entropy heuristics. Built with
+# ``b64encode`` rather than written as a literal because the carve-out now decodes
+# the WHOLE body: a hand-written literal with a stray '=' mid-string is not valid
+# base64, and the gate correctly refuses to exempt what it cannot decode. Decodes
+# to the webp signature (``RIFF`` at 0, ``WEBP`` at 8) plus benign filler.
+_WEBP_BODY = base64.b64encode(
+    b"RIFF" + b"\x12\x00\x00\x00" + b"WEBP" + b"\x00\x01\x02\x03" * 24
+).decode()
 _WEBP_URI = f"data:image/webp;base64,{_WEBP_BODY}"
 _IMG = f'<img src="{_WEBP_URI}" alt="Art Deco Diamond and Emerald Necklace in Platinum">'
 
@@ -81,20 +102,29 @@ _CRED_WOFF2_BODY = _WOFF2_HEAD_B64 + _JWS_NO_DOTS
 _CRED_WOFF2_BODY += "A" * ((4 - len(_CRED_WOFF2_BODY) % 4) % 4)
 _CRED_WOFF2_URI = f"data:font/woff2;base64,{_CRED_WOFF2_BODY}"
 
+# The four CSP metadata keys that put an outbound origin in the delivered policy,
+# read from the module under test so the tests cannot drift from the gate.
+_EGRESS_KEYS = _CSP_EGRESS_KEYS
+
+# The frontend CSP builder, for the coupling pin in :class:`TestCspGate`.
+_MCP_APP_SRCDOC_TS = (
+    Path(__file__).resolve().parents[1] / "website" / "src" / "lib" / "mcpAppSrcdoc.ts"
+)
+
 
 class TestBehaviour:
     """The media URI survives ONLY through the surface-scoped facade.
 
     The carve-out lives outside the bare passes, so these "survives
     byte-identical / is exempt" assertions target
-    ``redact_rendered_assistant_text`` — the one media-aware batch entry point.
+    ``redact_mcp_app_payload_text`` — the one media-aware batch entry point.
     That helper masks the media URI around both passes and restores it
     byte-identical, so the src is untouched. The inverse (a bare pass REDACTS a
     media URI) is pinned in :class:`TestBarePassesAreMediaUnaware`.
     """
 
     def test_image_data_uri_survives_facade_byte_identical(self) -> None:
-        result, warnings = redact_rendered_assistant_text(_IMG)
+        result, warnings = redact_mcp_app_payload_text(_IMG)
         assert result == _IMG
         assert warnings == []
 
@@ -103,18 +133,23 @@ class TestBehaviour:
         # the media-unaware passes, corrupting the src. Through the facade the mask
         # (not luck — this body DOES trip the heuristics, unlike ``_WEBP_BODY``)
         # leaves the src byte-identical.
-        result, warnings = redact_rendered_assistant_text(_CRED_IMG)
+        result, warnings = redact_mcp_app_payload_text(_CRED_IMG)
         assert result == _CRED_IMG
-        # Sanity: the bare pass proves this body really is redaction-bait.
+        # Quick check: the bare pass proves this body really is redaction-bait.
         bare, bare_warnings = redact_credentials(_CRED_IMG)
         assert bare != _CRED_IMG
         assert bare_warnings
 
-    def test_blob_url_is_exempt_through_the_facade(self) -> None:
-        html = '<img src="blob:https://dash.example.test/9f1c-4a2b-babe">'
-        # A blob:https URL embeds an http-looking run; the facade must leave it
-        # byte-identical through BOTH passes.
-        assert redact_rendered_assistant_text(html)[0] == html
+    def test_blob_url_is_not_in_scope(self) -> None:
+        # ``blob:`` is deliberately OUT of the carve-out: the consuming iframe's
+        # policy is ``img-src 'self' data:`` with no ``blob:``, so a blob URL
+        # cannot render there and exempting one would widen the carve-out with no
+        # defect to fix. It carries no MIME label or base64 body for the
+        # plausibility gate either. The pattern must not match one.
+        blob = "blob:https://dash.example.test/9f1c-4a2b-babe"
+        assert _MEDIA_DATA_URI_RE.search(blob) is None
+        masked, originals = _mask_media_data_uris(f'<img src="{blob}">', _media_body_is_clean)
+        assert originals == []
 
     def test_bare_jwt_outside_a_media_uri_is_still_redacted(self) -> None:
         result, warnings = redact_credentials(f"leaked: {_JWS}")
@@ -126,12 +161,12 @@ class TestBehaviour:
         # a text/plain base64 body must still be redacted — even through the
         # media-aware facade.
         uri = f"data:text/plain;base64,{_JWS}"
-        result, _ = redact_rendered_assistant_text(f"note: {uri}")
+        result, _ = redact_mcp_app_payload_text(f"note: {uri}")
         assert _JWS not in result
 
     def test_application_octet_stream_data_uri_is_still_scanned(self) -> None:
         uri = f"data:application/octet-stream;base64,{_JWS}"
-        result, _ = redact_rendered_assistant_text(f"blob: {uri}")
+        result, _ = redact_mcp_app_payload_text(f"blob: {uri}")
         assert _JWS not in result
 
 
@@ -181,7 +216,7 @@ class TestBarePassesAreMediaUnaware:
 
 class TestMaskRoundTrip:
     def test_mask_then_unmask_is_identity(self) -> None:
-        masked, originals = _mask_media_data_uris(_IMG)
+        masked, originals = _mask_media_data_uris(_IMG, _media_body_is_clean)
         assert _WEBP_URI not in masked
         assert originals == [_WEBP_URI]
         restored, unmask_warnings = _unmask_media_data_uris(masked, originals)
@@ -191,7 +226,7 @@ class TestMaskRoundTrip:
     def test_placeholder_carries_no_credential_or_base64_shape(self) -> None:
         # The whole point of the placeholder: a pass run between mask and unmask
         # must leave it untouched, or the restore would fail.
-        masked, originals = _mask_media_data_uris(_IMG)
+        masked, originals = _mask_media_data_uris(_IMG, _media_body_is_clean)
         scanned, warnings = redact_credentials(masked)
         assert scanned == masked
         assert warnings == []
@@ -200,14 +235,29 @@ class TestMaskRoundTrip:
         assert unmask_warnings == []
 
     def test_multiple_media_uris_are_masked_independently(self) -> None:
-        a = "data:image/webp;base64," + "Q" * 60
-        b = "data:font/woff2;base64," + "Z" * 60
-        html = f'<img src="{a}"> and url({b})'
-        assert redact_credentials(html)[0] == html
+        # Two DIFFERENT plausible containers (webp + woff2) in one input each get
+        # their own placeholder index and restore to their own original.
+        html = f'<img src="{_CRED_WEBP_URI}"> and url({_CRED_WOFF2_URI})'
+        masked, originals = _mask_media_data_uris(html, _media_body_is_clean)
+        assert originals == [_CRED_WEBP_URI, _CRED_WOFF2_URI]
+        assert _CRED_WEBP_URI not in masked
+        assert _CRED_WOFF2_URI not in masked
+        restored, warnings = _unmask_media_data_uris(masked, originals)
+        assert restored == html
+        assert warnings == []
+
+    def test_an_implausible_body_is_never_masked(self) -> None:
+        # A correctly-labelled MIME whose body decodes to no container signature
+        # is left RAW for the passes — the plausibility gate, not the label,
+        # decides. ``QQQQ…`` decodes to ``AAA…``, which is no container.
+        html = '<img src="data:image/webp;base64,' + "Q" * 60 + '">'
+        masked, originals = _mask_media_data_uris(html, _media_body_is_clean)
+        assert originals == []
+        assert masked == html
 
     def test_no_media_uri_is_a_cheap_noop(self) -> None:
         text = "no media here, just prose"
-        masked, originals = _mask_media_data_uris(text)
+        masked, originals = _mask_media_data_uris(text, _media_body_is_clean)
         assert masked == text
         assert originals == []
 
@@ -217,7 +267,7 @@ class TestBatchHardening:
     closed on an unresolved index, duplicate URIs round-trip, and a suspicious
     URL coexists with a media URI through the facade.
 
-    These target the batch helpers and the ``redact_rendered_assistant_text``
+    These target the batch helpers and the ``redact_mcp_app_payload_text``
     facade directly rather than the media-unaware bare passes.
     """
 
@@ -229,7 +279,7 @@ class TestBatchHardening:
         # \x00).
         text = f'\x00media:0\x00 and <img src="{_WEBP_URI}">'
 
-        masked, originals = _mask_media_data_uris(text)
+        masked, originals = _mask_media_data_uris(text, _media_body_is_clean)
         # The only masked span is the REAL URI; the injected sentinel was stripped.
         assert originals == [_WEBP_URI]
         assert "\x00media:0\x00 " not in masked  # attacker sentinel gone
@@ -261,7 +311,7 @@ class TestBatchHardening:
         # independent placeholders and both restore correctly.
         text = f'<img src="{_WEBP_URI}"> then again <img src="{_WEBP_URI}">'
 
-        masked, originals = _mask_media_data_uris(text)
+        masked, originals = _mask_media_data_uris(text, _media_body_is_clean)
         assert originals == [_WEBP_URI, _WEBP_URI]
         assert _WEBP_URI not in masked
 
@@ -276,7 +326,7 @@ class TestBatchHardening:
         exfil = f"https://evil.example/?data={_JWS}"
         text = f'{exfil} next to <img src="{_WEBP_URI}">'
 
-        result, warnings = redact_rendered_assistant_text(text)
+        result, warnings = redact_mcp_app_payload_text(text)
 
         # The media URI is preserved byte-identical.
         assert _WEBP_URI in result
@@ -286,6 +336,143 @@ class TestBatchHardening:
         assert warnings
         # No raw sentinel leaks.
         assert "\x00" not in result
+
+
+class TestWholeBodyScanIsTheBound:
+    """The exemption is licensed by the exempted bytes being CLEAN, not by the
+    render surface.
+
+    An MCP app always has an exfil path regardless of its CSP: it relays
+    ``tools/call`` to its own MCP server through the gateway (``McpAppFrame.tsx``
+    → ``/api/mcp-apps/call`` → ``mcp_gateway/app_call.py``, which forwards
+    iframe-controlled ``arguments``), and it receives the payload unredacted
+    either way. So ``connect-src 'none'`` does not mean "cannot exfiltrate", and a
+    signature check on the head is not enough either — a structurally valid
+    container can carry a secret in a metadata chunk. These pin the whole-body
+    scan that closes that.
+    """
+
+    def test_valid_png_carrying_a_secret_in_a_text_chunk_is_not_exempted(self) -> None:
+        # Real PNG magic, so the head signature passes; a real JWS stored ASCII in
+        # a tEXt chunk, so the body scan must refuse it. A signature check alone
+        # cannot catch this, which is why the whole-body scan is the bound.
+        body = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x2atEXtComment\x00" + _JWS.encode()
+        ).decode()
+        uri = f"data:image/png;base64,{body}"
+
+        masked, originals = _mask_media_data_uris(uri, _media_body_is_clean)
+        assert originals == [], "a secret-bearing image body must not be exempted"
+        assert masked == uri
+
+        # And through the facade the secret does not survive.
+        result, warnings = redact_mcp_app_payload_text(f'<img src="{uri}">')
+        assert body not in result
+        assert warnings
+
+    def test_valid_png_with_a_clean_body_is_exempted(self) -> None:
+        # Positive control for the test above: same container, no secret, so the
+        # carve-out still does its job and the image survives byte-identical.
+        body = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02\x03" * 40).decode()
+        uri = f"data:image/png;base64,{body}"
+
+        _, originals = _mask_media_data_uris(uri, _media_body_is_clean)
+        assert originals == [uri]
+        assert redact_mcp_app_payload_text(uri)[0] == uri
+
+    def test_a_credential_shaped_base64_text_is_still_exempt_when_the_bytes_are_clean(
+        self,
+    ) -> None:
+        # The whole point of masking survives the stricter gate: this body's
+        # base64 TEXT carries a JWS shape (the bare pass redacts it, asserted in
+        # TestBarePassesAreMediaUnaware) but its DECODED bytes hold no credential,
+        # so it is still exempted. Scanning decoded bytes is a different question
+        # from scanning the base64 text — that is why the fix is not a regression.
+        _, originals = _mask_media_data_uris(_CRED_WEBP_URI, _media_body_is_clean)
+        assert originals == [_CRED_WEBP_URI]
+
+    def test_an_oversize_body_is_refused_rather_than_exempted_unscanned(self, monkeypatch) -> None:
+        # Fail closed on size: skipping the scan to save the work would exempt
+        # exactly the unbounded body an attacker controls. Patched small so the
+        # test does not allocate the real 12M-char cap.
+        monkeypatch.setattr(redaction, "_MEDIA_MAX_BODY_B64_CHARS", 16)
+        body = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64).decode()
+        uri = f"data:image/png;base64,{body}"
+        assert len(body) > 16, "control: body must exceed the patched cap"
+
+        _, originals = _mask_media_data_uris(uri, _media_body_is_clean)
+        assert originals == []
+
+    def test_the_scan_predicate_is_required_not_defaulted(self) -> None:
+        # A caller cannot obtain the carve-out without supplying the scan that
+        # justifies it, so there is no way to reach the mask with the check off.
+        with pytest.raises(TypeError):
+            _mask_media_data_uris(_IMG)  # type: ignore[call-arg]
+
+
+class TestCspGate:
+    """The carve-out reaches a payload ONLY when its declared CSP grants the app
+    iframe no outbound origin.
+
+    This is the bound the whole exemption rests on. ``buildMcpAppCsp`` lets an
+    app's own ``connectDomains`` replace ``connect-src 'none'``, and the MCP
+    server authors both the app's JS and its CSP metadata — so "it renders in a
+    sandboxed iframe" is NOT on its own a reason to stop redacting. An app that
+    declares any outbound origin therefore keeps the strict, media-unaware pass
+    and keeps the inline-image false positive with it.
+    """
+
+    def test_no_csp_declared_yields_no_egress(self) -> None:
+        # Absent csp is the SEP-1865 default and yields the strictest policy.
+        assert _csp_grants_egress(None) is False
+        assert _csp_grants_egress({}) is False
+
+    def test_empty_domain_lists_yield_no_egress(self) -> None:
+        assert _csp_grants_egress({key: [] for key in _EGRESS_KEYS}) is False
+
+    def test_each_declared_domain_list_is_egress(self) -> None:
+        # Every one of the four lists puts an origin in the delivered policy:
+        # connect/frame replace a 'none' directive, resource widens img/script/
+        # style/font/media (an <img src="https://attacker/?s=…"> is egress too),
+        # base-uri changes where a relative URL resolves.
+        for key in _EGRESS_KEYS:
+            assert _csp_grants_egress({key: ["https://attacker.example"]}) is True, key
+
+    def test_an_unknown_csp_shape_fails_closed(self) -> None:
+        # csp is untrusted server JSON of arbitrary shape. Anything that is not
+        # None and not a dict cannot be shown to grant nothing, so it is egress.
+        for shape in ("connect-src *", 7, ["https://attacker.example"], True):
+            assert _csp_grants_egress(shape) is True, shape
+
+    def test_an_app_declaring_connect_domains_gets_the_strict_passes(self) -> None:
+        # The blocker case, end to end through the redactor the call site picks:
+        # a payload from an app with a declared connect-src does NOT get the
+        # carve-out, so a valid-headed webp body carrying a credential shape is
+        # redacted rather than delivered intact to a page that can POST it.
+        redactor = _payload_redactor({"connectDomains": ["https://attacker.example"]})
+        out = _redact_leaves({"img": _CRED_IMG}, redactor)
+        assert out["img"] != _CRED_IMG
+        assert _CRED_WEBP_BODY not in out["img"]
+
+    def test_an_app_declaring_nothing_gets_the_carve_out(self) -> None:
+        # And the fix still works for the app the defect was reported against.
+        redactor = _payload_redactor(None)
+        out = _redact_leaves({"img": _CRED_IMG}, redactor)
+        assert out["img"] == _CRED_IMG
+
+    def test_the_gate_covers_every_domain_list_build_mcp_app_csp_reads(self) -> None:
+        # Coupling pin: ``buildMcpAppCsp`` reads exactly four ``*Domains`` keys
+        # off the csp metadata. Extract them from the frontend source and require
+        # the backend gate to cover every one, so adding a fifth widenable
+        # directive to the CSP builder without teaching this gate fails here
+        # rather than silently handing the carve-out to an app that can egress.
+        source = _MCP_APP_SRCDOC_TS.read_text(encoding="utf-8")
+        declared = set(re.findall(r"csp\?\.([A-Za-z]+Domains)", source))
+        assert declared, "no csp?.*Domains reads found — did the builder move?"
+        assert declared == set(_EGRESS_KEYS), (
+            "buildMcpAppCsp reads a domain list the backend carve-out gate does "
+            f"not treat as egress: {sorted(declared - set(_EGRESS_KEYS))}"
+        )
 
 
 class TestScopePrimitiveCoupling:
@@ -360,5 +547,3 @@ class TestMediaHeadIsPlausible:
         # head looks XML-ish.
         assert _media_head_is_plausible("image/svg+xml", b"<?xml version=") is False
         assert _media_head_is_plausible("image/svg+xml", b"<svg xmlns=") is False
-
-

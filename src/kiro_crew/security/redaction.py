@@ -20,6 +20,8 @@ gate is a separate predicate so a refusal can name which one fired.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import logging
 import math
 import posixpath
@@ -910,41 +912,43 @@ _REDACTED_ENCODED_CREDENTIAL_TAG = "[REDACTED: encoded credential]"
 CREDENTIAL_REDACTION_TAGS = (_REDACTED_CREDENTIAL_TAG, _REDACTED_ENCODED_CREDENTIAL_TAG)
 
 
-# ── Inline-media data:/blob: URI carve-out ──
-# A ``data:`` image/font URI and a ``blob:`` URL are RENDERED sub-resources, not
-# an egress channel: a widget's ``<img src="data:image/webp;base64,…">`` renders
-# inline under the widget CSP (``img-src data: blob:``, a documented "NEVER
-# fetches" contract), and a ``blob:`` URL points at in-memory bytes that never
-# leave the browser. Their base64 bodies are also structurally IDENTICAL to an
-# encoded secret — a webp body routinely contains an ``eyJ``-anchored run or a
-# 40+ base64 run — so the credential and exfil passes over-match them and splice
-# a ``[REDACTED: credential]`` tag INTO the ``src`` attribute, stranding the
-# image (the exact defect this carve-out fixes).
+# ── Inline-media data: URI carve-out ──
+# An ``image/``/``font/`` ``data:`` URI is a RENDERED sub-resource: an
+# ``<img src="data:image/webp;base64,…">`` decodes in the browser and issues no
+# request. Its base64 body is also structurally IDENTICAL to an encoded secret —
+# a webp body routinely contains an ``eyJ``-anchored run or a 40+ base64 run — so
+# the credential and exfil passes over-match it and splice a
+# ``[REDACTED: credential]`` tag INTO the ``src`` attribute, stranding the image
+# (the exact defect this carve-out fixes).
 #
 # The passes cannot tell "webp bytes" from "encoded AWS secret" by pattern, and
 # narrowing the base64 class opens a chunking bypass (see the notes on
 # ``_B64_CHUNK_RE`` / ``_BARE_SECRET_RUN_RE``). So this is a BOUNDARY carve-out,
 # not a matcher change: mask the media-URI bodies to a redaction-inert
-# placeholder, run the pass, then restore them byte-identical — the same
-# mask/restore shape the widget parser uses for inline code.
+# placeholder, run the pass, then restore them byte-identical.
 #
-# Why this opens no capability. (1) MEDIA-SCOPED: only ``data:`` URIs whose MIME
-# type is a renderable image/font (the ``image/``·``font/`` subset of
-# ``BINARY_MIME_ALLOWLIST``) and ``blob:`` URLs are masked; a ``data:text/…`` or
+# What bounds it. (1) MEDIA-SCOPED: only ``data:`` URIs whose MIME type is a
+# renderable image/font (the ``image/``·``font/`` subset of
+# ``BINARY_MIME_ALLOWLIST``) are masked; a ``data:text/…`` or
 # ``data:application/…`` blob is still scanned in full, so a secret cannot ride a
-# ``data:text/plain;base64,<key>`` past the redactor. (2) A masked URI does not
-# EGRESS: a ``data:`` image renders inline and a ``blob:`` URL is same-origin
-# in-memory, so exempting its body cannot leak a credential to a chat channel the
-# way an ``http(s)://…?body=<secret>`` URL would — those still run every pass.
-# (3) The placeholder itself is inert: a fixed marker plus a decimal index, no
-# base64 run and no credential shape, so a pass leaves it untouched and the
-# restore is exact.
+# ``data:text/plain;base64,<key>`` past the redactor. (2) PLAUSIBILITY-GATED: the
+# MIME label is an unverified claim, so the decoded head must match a container
+# signature for the DECLARED type (``_MEDIA_CONTAINER_SIGNATURES``). (3) The
+# placeholder itself is inert: a fixed marker plus a decimal index, no base64 run
+# and no credential shape, so a pass leaves it untouched and the restore is exact.
+# (4) DEFAULT-DENY AND CSP-GATED at the call site: the only entry point is
+# ``security.redact_mcp_app_payload_text``, and its only caller applies it only to
+# a payload whose delivered CSP declares no outbound origins at all. That last
+# bound does NOT live here — this module knows nothing about a CSP — see
+# ``_payload_redactor`` in ``mcp_apps_render.py``.
 #
-# ``sanitize.ts`` mirrors this (``maskMediaDataUris``); the media scope is pinned
-# equal across the two sides by ``test_media_data_uri_carveout.py``.
-_MEDIA_DATA_URI_RE = re.compile(
-    r"data:(?:image|font)/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+" r"|blob:[^\s\"'<>)]+"
-)
+# ``blob:`` is deliberately NOT in scope. The one consuming iframe's policy is
+# ``img-src 'self' data:`` (``buildMcpAppCsp`` in ``website/src/lib/
+# mcpAppSrcdoc.ts``) with no ``blob:``, so a ``blob:`` sub-resource cannot render
+# there — exempting one would widen the carve-out with no defect to fix, and a
+# ``blob:`` URL carries no MIME label and no base64 body for the plausibility
+# gate to check.
+_MEDIA_DATA_URI_RE = re.compile(r"data:(?:image|font)/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
 
 # The media-URI prefix, ``\A``-anchored so it matches only at position 0.
 # ``_media_data_uri_is_plausible`` uses it to split the declared MIME from the
@@ -968,8 +972,12 @@ _MEDIA_MASK_CLOSE = "\x00"
 _MEDIA_PLACEHOLDER_RE = re.compile("\x00media:(\\d+)\x00")
 
 
-def _mask_media_data_uris(text: str) -> tuple[str, list[str]]:
-    """Replace inline media ``data:``/``blob:`` URIs with inert placeholders.
+def _mask_media_data_uris(text: str, body_is_clean: Callable[[str], bool]) -> tuple[str, list[str]]:
+    """Replace exemptable inline media ``data:`` URIs with inert placeholders.
+
+    ``body_is_clean`` decides whether a decoded body carries nothing the passes
+    would have redacted; it is REQUIRED rather than defaulted, so a caller cannot
+    obtain the carve-out without supplying the scan that justifies it.
 
     Returns ``(masked_text, originals)`` where ``originals[i]`` is the URI that
     placeholder index ``i`` stands for. ``_unmask_media_data_uris`` restores them.
@@ -983,19 +991,17 @@ def _mask_media_data_uris(text: str) -> tuple[str, list[str]]:
     latter restoring the attacker's sentinel into a genuine media URI.
     """
     text = _MEDIA_PLACEHOLDER_RE.sub("", text)
-    if "data:" not in text and "blob:" not in text:
+    if "data:" not in text:
         return text, []
     originals: list[str] = []
 
     def _sub(match: re.Match[str]) -> str:
         candidate = match.group(0)
-        # Plausibility gate. The MIME label is an unverified claim:
-        # ``data:image/png;base64,<base64 of an AWS key pair>`` matches the regex
-        # but its decoded head matches no container signature, so masking it here
-        # would exempt a mislabelled secret from both passes. A ``blob:`` URL
-        # carries no declared MIME or base64 body, so it is masked
-        # unconditionally; only ``data:…;base64,`` bodies are gated.
-        if not candidate.startswith("blob:") and not _media_data_uri_is_plausible(candidate):
+        # Signature + whole-body scan. The MIME label is an unverified claim, and
+        # a valid container can still carry a secret in a metadata chunk, so
+        # neither check alone is enough. EVERY candidate is gated — there is no
+        # unconditional mask.
+        if not _media_data_uri_is_exemptable(candidate, body_is_clean):
             # Not a real container — leave it RAW so the credential/base64/exfil
             # passes scan it in full, exactly as they do on every strict surface.
             return candidate
@@ -1006,14 +1012,47 @@ def _mask_media_data_uris(text: str) -> tuple[str, list[str]]:
     return _MEDIA_DATA_URI_RE.sub(_sub, text), originals
 
 
-def _media_data_uri_is_plausible(uri: str) -> bool:
-    """Return True iff a ``data:(image|font)/…;base64,<body>`` URI is a real
-    container for its declared MIME type.
+#: Largest base64 body this will decode to scan. 12M base64 chars decode to ~9 MB,
+#: just over the 8 MiB MCP-app spool cap (``mcp_apps_render._MAX_SPOOL_BYTES``),
+#: so a real payload is always inside it. A body larger than this is NOT exempted:
+#: refusing to exempt costs a broken image, while skipping the scan to save the
+#: work would exempt exactly the unbounded body an attacker controls.
+_MEDIA_MAX_BODY_B64_CHARS = 12 * 1024 * 1024
 
-    Decodes the head of the base64 body and calls :func:`_media_head_is_plausible`
-    — the batch mirror of the streaming framer's PROBE gate. A malformed prefix,
-    a body too short to decide, or undecodable base64 all fail CLOSED (return
-    False), so a mislabelled or unparseable URI is scanned rather than exempted.
+
+def _media_data_uri_is_exemptable(uri: str, body_is_clean: Callable[[str], bool]) -> bool:
+    """Return True iff this media URI's body may skip the redaction passes.
+
+    Two conditions, both required. (1) The decoded HEAD matches a container
+    signature for the DECLARED MIME type, because the label is an unverified
+    claim. (2) ``body_is_clean`` returns True for the WHOLE decoded body.
+
+    Condition 2 is the one that makes the exemption safe, and it replaces an
+    earlier argument that the render surface could not egress. That argument does
+    not hold: an MCP app reaches its own server through ``tools/call``
+    (``mcp_gateway/app_call.py`` forwards iframe-controlled ``arguments``), a
+    channel no CSP directive governs, and the server that authors the app also
+    authors the ``inputSchema`` those arguments are validated against. So a
+    credential left in an exempted body IS reachable, and the only defensible
+    bound is that the exempted bytes carry no credential at all.
+
+    Scanning the DECODED bytes is a different question from scanning the base64
+    TEXT, which is why this does not reintroduce the false positive it fixes: as
+    text, a webp body is full of long ``[A-Za-z0-9+/=]`` runs and trips the
+    base64/entropy heuristics; decoded, those bytes are binary and essentially
+    never yield a 40+ character run confined to that class, while a secret
+    genuinely embedded in a ``tEXt``, ``COM`` or EXIF chunk is stored as ASCII
+    and IS seen, so a valid container carrying a secret in its metadata is not
+    exempted.
+
+    ``body_is_clean`` is injected rather than called directly because a complete
+    scan needs the exfiltration-URL pass too, which lives in ``exfil.py`` — the
+    layer ABOVE this module. This module imports nothing from the package, so the
+    composition belongs in the facade (see ``redact_mcp_app_payload_text``).
+
+    Fails CLOSED on every uncertainty: a malformed prefix, a body too short to
+    decide, undecodable base64, or a body over
+    :data:`_MEDIA_MAX_BODY_B64_CHARS`.
     """
     prefix = _MEDIA_URI_PREFIX_RE.match(uri)
     if prefix is None:
@@ -1022,8 +1061,11 @@ def _media_data_uri_is_plausible(uri: str) -> bool:
     # ``data:`` scheme and the ``;base64,`` marker.
     mime = prefix.group(0)[len("data:") : -len(";base64,")]
     body = uri[prefix.end() :]
+    if len(body) > _MEDIA_MAX_BODY_B64_CHARS:
+        return False
     # 16 base64 chars decode to 12 bytes — enough for the longest signature
-    # (``RIFF`` at 0 AND ``WEBP`` at 8). Mirrors the framer's 16-char PROBE head.
+    # (``RIFF`` at 0 AND ``WEBP`` at 8). Checked FIRST because it is O(1) and
+    # rejects a mislabelled body before the whole-body decode below.
     head_b64 = body[:16]
     # base64 decodes in 4-char quanta; drop any trailing partial quantum so a
     # 15-char slice does not raise. A short body that decodes to fewer bytes than
@@ -1038,7 +1080,16 @@ def _media_data_uri_is_plausible(uri: str) -> bool:
         head = base64.b64decode(head_b64, validate=True)
     except ValueError:
         return False
-    return _media_head_is_plausible(mime, head)
+    if not _media_head_is_plausible(mime, head):
+        return False
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except ValueError:
+        return False
+    # latin-1 maps every byte to one codepoint and never raises, so an ASCII run
+    # inside binary survives into the scanned text exactly as stored, and no byte
+    # is dropped the way a lossy utf-8 decode would drop it.
+    return body_is_clean(raw.decode("latin-1"))
 
 
 def _unmask_media_data_uris(text: str, originals: list[str]) -> tuple[str, list[str]]:
@@ -1058,7 +1109,7 @@ def _unmask_media_data_uris(text: str, originals: list[str]) -> tuple[str, list[
     mask/restore invariant was violated and a media URI may have been lost.
 
     Returns ``(restored_text, warnings)``. The caller
-    (``redact_rendered_assistant_text``) threads these warnings into its
+    (``redact_mcp_app_payload_text``) threads these warnings into its
     concatenated return so a caller that surfaces warnings sees this one too.
     """
     warnings: list[str] = []
@@ -1139,13 +1190,13 @@ def _media_head_is_plausible(mime: str, head: bytes) -> bool:
 def redact_credentials(text: str) -> tuple[str, list[str]]:
     """Redact raw credential patterns from text, including base64-encoded.
 
-    This pass is media-UNAWARE: an inline media ``data:``/``blob:`` URI is
-    scanned in full like any other text, so its base64 body is subject to the
+    This pass is media-UNAWARE: an inline media ``data:`` URI is scanned in full
+    like any other text, so its base64 body is subject to the
     credential/base64/bare-secret heuristics. The inline-media carve-out is
     default-deny and surface-scoped — it lives only in the composed
-    ``redact_rendered_assistant_text`` facade helper, which masks once around
-    both passes for the dashboard's browser-rendered assistant text. Every
-    direct caller of this pass is strict.
+    ``redact_mcp_app_payload_text`` facade helper, whose one caller applies it
+    only to an MCP-app payload whose delivered CSP declares no outbound origins.
+    Every direct caller of this pass is strict.
 
     Returns (cleaned_text, list_of_warnings).
     """
