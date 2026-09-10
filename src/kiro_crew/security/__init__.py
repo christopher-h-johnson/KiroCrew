@@ -369,6 +369,8 @@ from .redaction import (
     _HEX_ONLY_RE,
     _LOCAL_PATH_PLACEHOLDER,
     _LOCAL_PATH_RE,
+    _MEDIA_PLACEHOLDER_RE,
+    _MEDIA_URI_PREFIX_RE,
     _PREFILTER_MIN_LEN,
     _PRINTABLE_BYTES,
     _REDACTED_CREDENTIAL_TAG,
@@ -389,9 +391,12 @@ from .redaction import (
     _has_all_three_char_classes,
     _looks_like_secret_key,
     _lowercase_run_exceeds,
+    _mask_media_data_uris,
+    _media_head_is_plausible,
     _might_contain_credential,
     _shannon_entropy,
     _text_contains_bare_secret,
+    _unmask_media_data_uris,
     _vowel_ratio,
     get_credential_patterns,
     redact_credentials,
@@ -764,6 +769,36 @@ def redact(text: str) -> str:
     text = redact_exfiltration_urls(text)[0]
     text = redact_credentials(text)[0]
     return text
+
+
+def redact_rendered_assistant_text(text: str) -> tuple[str, list[str]]:
+    """Both passes with the inline-media carve-out, masked ONCE around both.
+
+    This is the ONLY batch entry point that carries the inline-media
+    ``data:``/``blob:`` carve-out. It is scoped to a single surface:
+    dashboard browser-rendered assistant text ONLY — the render path that can
+    turn a ``data:`` image into a picture under ``img-src data: blob:``. Every
+    other egress path (Slack, the channel-neutral messaging driver, the
+    thinking stream, tool cards, labels, prompt input) calls the media-UNAWARE
+    passes directly and scans inline media in full.
+
+    It lives in the facade because it composes ``redaction.py`` with
+    ``exfil.py`` — the layering rule the package already documents for
+    :func:`redact` (``redaction.py`` imports nothing from the package;
+    ``exfil.py`` imports only ``redaction.py``).
+
+    Masks once around BOTH passes rather than once per pass — strictly less work
+    than the old per-pass masking, and it keeps the placeholders inert across
+    both scans. Returns ``(cleaned_text, warnings)`` with the exfil and
+    credential warning lists concatenated; the mask/unmask helpers surface their
+    own warnings (an unresolved placeholder index fails closed to a credential
+    tag with a count-only warning) through the same list.
+    """
+    text, media = _mask_media_data_uris(text)
+    text, exfil_warnings = redact_exfiltration_urls(text)
+    text, cred_warnings = redact_credentials(text)
+    text, unmask_warnings = _unmask_media_data_uris(text, media)
+    return text, exfil_warnings + cred_warnings + unmask_warnings
 
 
 # ── Streaming redaction (pentest issue 3) ──

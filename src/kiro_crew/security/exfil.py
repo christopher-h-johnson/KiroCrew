@@ -1060,6 +1060,17 @@ EXFILTRATION_REDACTION_TAG_PREFIX = "[REDACTED: suspicious URL to "
 def redact_exfiltration_urls(text: str) -> tuple[str, list[str]]:
     """Scan and redact suspicious exfiltration URLs from text.
 
+    This pass carries NO inline-media awareness: an inline media
+    ``data:``/``blob:`` URI is scanned in full like any other text. A
+    ``blob:https://origin/uuid`` URL embeds an ``http``-looking substring that
+    ``_URL_RE`` picks up, and a media ``data:`` base64 body is structurally
+    indistinguishable from an encoded secret, so both are matched here. The
+    inline-media carve-out — which exempts a rendered sub-resource that never
+    egresses under the widget CSP — lives ONLY in the composed
+    :func:`kiro_crew.security.redact_rendered_assistant_text` helper, applied
+    once around both passes, and is reachable only from the dashboard's
+    browser-rendered assistant-text sites.
+
     Returns (cleaned_text, list_of_warnings).
     """
     warnings = scan_exfiltration_urls(text)

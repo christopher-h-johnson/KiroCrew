@@ -43,25 +43,39 @@ logger = logging.getLogger(__name__)
 
 
 def _redact_leaves(obj: Any) -> Any:
-    """Recursively apply credential + exfiltration-URL redaction to every
-    string leaf of *obj*, returning a redacted copy.
+    """Recursively redact every string leaf of *obj* for delivery to the
+    sandboxed MCP-app iframe, returning a redacted copy.
 
     App payloads (``tool_input`` / ``structured_content`` / ``result_content``)
-    are delivered into a server-authored iframe that can open network
-    connections to its declared CSP origins; a credential or exfil URL that
-    leaks through a tool result must be scrubbed before it crosses that trust
-    boundary (same discipline the transcript/WS redaction passes apply). Bounded
-    by the spool size cap already enforced on load.
+    are delivered into a server-authored iframe the dashboard renders under the
+    widget CSP (``img-src data: blob:``); a credential or exfil URL that leaks
+    through a tool result must be scrubbed before it crosses that trust
+    boundary. But that same render contract makes an inline ``data:image``/
+    ``data:font`` body a legitimate carve-out: the strict passes are media-
+    UNAWARE and would splice a ``[REDACTED: credential]`` tag INTO a base64 body
+    (a webp body is structurally indistinguishable from an encoded secret),
+    stranding the image the app is meant to render. So each leaf routes through
+    ``redact_rendered_assistant_text`` — the ONE composed helper carrying the
+    default-deny, plausibility-gated inline-media carve-out (masks a media URI
+    whose decoded head matches a container signature, runs both strict passes,
+    restores byte-identical; a mislabelled ``data:image/png;base64,<secret>``
+    matches no signature and is scanned in full). Credentials and exfil URLs
+    outside a plausible media body are still redacted. Bounded by the spool size
+    cap already enforced on load.
     """
     if isinstance(obj, str):
-        return security.redact(obj)
+        return security.redact_rendered_assistant_text(obj)[0]
     if isinstance(obj, list):
         return [_redact_leaves(x) for x in obj]
     if isinstance(obj, dict):
         # Redact string KEYS too — a credential can appear as a dict key, not
-        # just a value.
+        # just a value. A key is not a media surface, but routing it through the
+        # same helper is harmless (a bare key never matches the media pattern)
+        # and keeps one redaction entry point for this function.
         return {
-            (security.redact(k) if isinstance(k, str) else k): _redact_leaves(v)
+            (
+                security.redact_rendered_assistant_text(k)[0] if isinstance(k, str) else k
+            ): _redact_leaves(v)
             for k, v in obj.items()
         }
     return obj

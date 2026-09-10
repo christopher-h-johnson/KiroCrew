@@ -20,8 +20,7 @@ gate is a separate predicate so a refusal can name which one fired.
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
+import logging
 import math
 import posixpath
 import re
@@ -30,6 +29,8 @@ from collections import Counter
 from collections.abc import Callable
 
 from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
+
+logger = logging.getLogger(__name__)
 
 # ── Credential Output Redaction ──
 # Catches raw credential patterns in LLM output / tool results,
@@ -909,8 +910,242 @@ _REDACTED_ENCODED_CREDENTIAL_TAG = "[REDACTED: encoded credential]"
 CREDENTIAL_REDACTION_TAGS = (_REDACTED_CREDENTIAL_TAG, _REDACTED_ENCODED_CREDENTIAL_TAG)
 
 
+# ── Inline-media data:/blob: URI carve-out ──
+# A ``data:`` image/font URI and a ``blob:`` URL are RENDERED sub-resources, not
+# an egress channel: a widget's ``<img src="data:image/webp;base64,…">`` renders
+# inline under the widget CSP (``img-src data: blob:``, a documented "NEVER
+# fetches" contract), and a ``blob:`` URL points at in-memory bytes that never
+# leave the browser. Their base64 bodies are also structurally IDENTICAL to an
+# encoded secret — a webp body routinely contains an ``eyJ``-anchored run or a
+# 40+ base64 run — so the credential and exfil passes over-match them and splice
+# a ``[REDACTED: credential]`` tag INTO the ``src`` attribute, stranding the
+# image (the exact defect this carve-out fixes).
+#
+# The passes cannot tell "webp bytes" from "encoded AWS secret" by pattern, and
+# narrowing the base64 class opens a chunking bypass (see the notes on
+# ``_B64_CHUNK_RE`` / ``_BARE_SECRET_RUN_RE``). So this is a BOUNDARY carve-out,
+# not a matcher change: mask the media-URI bodies to a redaction-inert
+# placeholder, run the pass, then restore them byte-identical — the same
+# mask/restore shape the widget parser uses for inline code.
+#
+# Why this opens no capability. (1) MEDIA-SCOPED: only ``data:`` URIs whose MIME
+# type is a renderable image/font (the ``image/``·``font/`` subset of
+# ``BINARY_MIME_ALLOWLIST``) and ``blob:`` URLs are masked; a ``data:text/…`` or
+# ``data:application/…`` blob is still scanned in full, so a secret cannot ride a
+# ``data:text/plain;base64,<key>`` past the redactor. (2) A masked URI does not
+# EGRESS: a ``data:`` image renders inline and a ``blob:`` URL is same-origin
+# in-memory, so exempting its body cannot leak a credential to a chat channel the
+# way an ``http(s)://…?body=<secret>`` URL would — those still run every pass.
+# (3) The placeholder itself is inert: a fixed marker plus a decimal index, no
+# base64 run and no credential shape, so a pass leaves it untouched and the
+# restore is exact.
+#
+# ``sanitize.ts`` mirrors this (``maskMediaDataUris``); the media scope is pinned
+# equal across the two sides by ``test_media_data_uri_carveout.py``.
+_MEDIA_DATA_URI_RE = re.compile(
+    r"data:(?:image|font)/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+" r"|blob:[^\s\"'<>)]+"
+)
+
+# The media-URI prefix, ``\A``-anchored so it matches only at position 0.
+# ``_media_data_uri_is_plausible`` uses it to split the declared MIME from the
+# base64 body. Spells ``data:(?:image|font)/`` LITERALLY (rather than sharing a
+# built constant) so the coupling test can extract the MIME alternation from
+# source and pin it equal to ``_MEDIA_DATA_URI_RE`` — the convention
+# ``_B64_CHUNK_RE`` / ``_BARE_SECRET_RUN_RE`` already use.
+_MEDIA_URI_PREFIX_RE = re.compile(r"\Adata:(?:image|font)/[A-Za-z0-9.+-]+;base64,")
+
+# Placeholder body carries a decimal index only, so it matches no credential
+# pattern and no base64 run: `\x00` sentinels bound it and are outside every
+# credential/base64/URL character class, so a pass cannot grow a match across it.
+_MEDIA_MASK_OPEN = "\x00media:"
+_MEDIA_MASK_CLOSE = "\x00"
+
+# The placeholder SHAPE, matching what ``_mask_media_data_uris`` emits: the
+# ``\x00media:`` marker, a decimal index, and the closing ``\x00``. Strips
+# attacker-injected look-alikes from model text before masking so an injected
+# sentinel cannot survive into the output or collide with a real placeholder
+# index. A ``\x00`` in model output has no legitimate producer.
+_MEDIA_PLACEHOLDER_RE = re.compile("\x00media:(\\d+)\x00")
+
+
+def _mask_media_data_uris(text: str) -> tuple[str, list[str]]:
+    """Replace inline media ``data:``/``blob:`` URIs with inert placeholders.
+
+    Returns ``(masked_text, originals)`` where ``originals[i]`` is the URI that
+    placeholder index ``i`` stands for. ``_unmask_media_data_uris`` restores them.
+    A pass runs between the two calls and must leave the placeholders untouched —
+    they carry no credential or base64 shape by construction.
+
+    Any pre-existing placeholder-shaped text is stripped from the input BEFORE
+    masking. A ``\\x00media:<index>\\x00`` sentinel in model output has no
+    legitimate producer, and leaving it in place lets an attacker's sentinel
+    survive into the output or collide with a real placeholder index — the
+    latter restoring the attacker's sentinel into a genuine media URI.
+    """
+    text = _MEDIA_PLACEHOLDER_RE.sub("", text)
+    if "data:" not in text and "blob:" not in text:
+        return text, []
+    originals: list[str] = []
+
+    def _sub(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        # Plausibility gate. The MIME label is an unverified claim:
+        # ``data:image/png;base64,<base64 of an AWS key pair>`` matches the regex
+        # but its decoded head matches no container signature, so masking it here
+        # would exempt a mislabelled secret from both passes. A ``blob:`` URL
+        # carries no declared MIME or base64 body, so it is masked
+        # unconditionally; only ``data:…;base64,`` bodies are gated.
+        if not candidate.startswith("blob:") and not _media_data_uri_is_plausible(candidate):
+            # Not a real container — leave it RAW so the credential/base64/exfil
+            # passes scan it in full, exactly as they do on every strict surface.
+            return candidate
+        index = len(originals)
+        originals.append(candidate)
+        return f"{_MEDIA_MASK_OPEN}{index}{_MEDIA_MASK_CLOSE}"
+
+    return _MEDIA_DATA_URI_RE.sub(_sub, text), originals
+
+
+def _media_data_uri_is_plausible(uri: str) -> bool:
+    """Return True iff a ``data:(image|font)/…;base64,<body>`` URI is a real
+    container for its declared MIME type.
+
+    Decodes the head of the base64 body and calls :func:`_media_head_is_plausible`
+    — the batch mirror of the streaming framer's PROBE gate. A malformed prefix,
+    a body too short to decide, or undecodable base64 all fail CLOSED (return
+    False), so a mislabelled or unparseable URI is scanned rather than exempted.
+    """
+    prefix = _MEDIA_URI_PREFIX_RE.match(uri)
+    if prefix is None:
+        return False
+    # The prefix is ``data:<mime>;base64,`` — the MIME is the span between the
+    # ``data:`` scheme and the ``;base64,`` marker.
+    mime = prefix.group(0)[len("data:") : -len(";base64,")]
+    body = uri[prefix.end() :]
+    # 16 base64 chars decode to 12 bytes — enough for the longest signature
+    # (``RIFF`` at 0 AND ``WEBP`` at 8). Mirrors the framer's 16-char PROBE head.
+    head_b64 = body[:16]
+    # base64 decodes in 4-char quanta; drop any trailing partial quantum so a
+    # 15-char slice does not raise. A short body that decodes to fewer bytes than
+    # a signature needs simply fails the match, which is the correct fail-closed
+    # outcome.
+    head_b64 = head_b64[: len(head_b64) - (len(head_b64) % 4)]
+    if not head_b64:
+        return False
+    try:
+        # binascii.Error (the concrete decode failure) is a subclass of
+        # ValueError, so catching ValueError covers a malformed body too.
+        head = base64.b64decode(head_b64, validate=True)
+    except ValueError:
+        return False
+    return _media_head_is_plausible(mime, head)
+
+
+def _unmask_media_data_uris(text: str, originals: list[str]) -> tuple[str, list[str]]:
+    """Restore the URIs masked by :func:`_mask_media_data_uris`.
+
+    Restores positionally in a SINGLE ``_MEDIA_PLACEHOLDER_RE.sub`` pass with an
+    index lookup, rather than a per-index count-1 ``str.replace`` loop. The
+    single pass is positionally exact (each placeholder resolves to the original
+    at its captured index, not the Nth occurrence) and duplicate-tolerant (the
+    same index appearing twice — which segmentation never emits but a
+    hand-crafted input could — restores the same original at both sites).
+
+    An unresolved index (out of range, or negative) FAILS CLOSED: it is replaced
+    with :data:`_REDACTED_CREDENTIAL_TAG`, never a raw ``\\x00`` sentinel. Each
+    such miss appends a COUNT-ONLY warning (no secret bytes, no index value in
+    the surfaced text) and is logged at ERROR — an unresolved placeholder means a
+    mask/restore invariant was violated and a media URI may have been lost.
+
+    Returns ``(restored_text, warnings)``. The caller
+    (``redact_rendered_assistant_text``) threads these warnings into its
+    concatenated return so a caller that surfaces warnings sees this one too.
+    """
+    warnings: list[str] = []
+
+    def _restore(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        if 0 <= index < len(originals):
+            return originals[index]
+        warnings.append("Redacted unresolved media placeholder (fail-closed)")
+        logger.error(
+            "media placeholder index %d out of range (have %d originals); "
+            "failing closed to a credential tag",
+            index,
+            len(originals),
+        )
+        return _REDACTED_CREDENTIAL_TAG
+
+    return _MEDIA_PLACEHOLDER_RE.sub(_restore, text), warnings
+
+
+# ── Container-signature plausibility gate ──
+# The MIME label is an UNVERIFIED claim: ``data:image/png;base64,<base64 of an
+# AWS key pair>`` passes byte-identical while the same blob unlabelled is
+# redacted. So ``_media_data_uri_is_plausible`` decodes the head of the body and
+# requires it to match a container signature for the DECLARED type. Anything not
+# in this table is NOT exempt — the table is an explicit allowlist that replaces
+# the open ``[A-Za-z0-9.+-]+`` subtype pattern with a fixed set of real
+# containers.
+#
+# ``image/svg+xml`` is deliberately ABSENT: it is text and script-capable, not a
+# binary container, so it has no magic bytes to check and does not belong here.
+#
+# Measurement: 16 base64 characters decode to 12 bytes, enough for the LONGEST
+# signature checked — webp needs ``RIFF`` at 0 AND ``WEBP`` at 8, i.e. 12 bytes.
+# ``_media_data_uri_is_plausible`` decodes exactly that 16-char head.
+#
+# Each entry maps a declared MIME to a tuple of ALTERNATIVES; the head is
+# plausible if ANY alternative matches. An alternative is itself a tuple of
+# ``(offset, magic)`` checks, ALL of which must match — that is how webp requires
+# ``RIFF`` at 0 AND ``WEBP`` at 8, and how gif accepts either ``GIF87a`` or
+# ``GIF89a``.
+_MEDIA_CONTAINER_SIGNATURES: dict[str, tuple[tuple[tuple[int, bytes], ...], ...]] = {
+    "image/png": (((0, b"\x89PNG\r\n\x1a\n"),),),
+    "image/jpeg": (((0, b"\xff\xd8\xff"),),),
+    "image/gif": (((0, b"GIF87a"),), ((0, b"GIF89a"),)),
+    "image/webp": (((0, b"RIFF"), (8, b"WEBP")),),
+    "image/bmp": (((0, b"BM"),),),
+    "image/avif": (((4, b"ftyp"),),),
+    "image/heic": (((4, b"ftyp"),),),
+    "font/woff2": (((0, b"wOF2"),),),
+    "font/woff": (((0, b"wOFF"),),),
+    "font/ttf": (((0, b"\x00\x01\x00\x00"),),),
+    "font/otf": (((0, b"OTTO"),),),
+}
+
+
+def _media_head_is_plausible(mime: str, head: bytes) -> bool:
+    """Return True iff ``head`` matches a container signature for ``mime``.
+
+    ``mime`` is the declared ``image/…`` or ``font/…`` type; ``head`` is the
+    decoded first bytes of the base64 body (16 base64 chars → 12 bytes is enough
+    for the longest signature, ``RIFF``+``WEBP``). Fails CLOSED: a MIME absent
+    from :data:`_MEDIA_CONTAINER_SIGNATURES` returns False, so a mislabelled or
+    unknown type (including ``image/svg+xml``) is never exempted.
+
+    A type is plausible if ANY of its alternatives matches, where an alternative
+    matches only if EVERY ``(offset, magic)`` check within it does.
+    """
+    alternatives = _MEDIA_CONTAINER_SIGNATURES.get(mime)
+    if alternatives is None:
+        return False
+    return any(
+        all(head[offset : offset + len(magic)] == magic for offset, magic in checks)
+        for checks in alternatives
+    )
+
+
 def redact_credentials(text: str) -> tuple[str, list[str]]:
     """Redact raw credential patterns from text, including base64-encoded.
+
+    This pass is media-UNAWARE: an inline media ``data:``/``blob:`` URI is
+    scanned in full like any other text, so its base64 body is subject to the
+    credential/base64/bare-secret heuristics. The inline-media carve-out is
+    default-deny and surface-scoped — it lives only in the composed
+    ``redact_rendered_assistant_text`` facade helper, which masks once around
+    both passes for the dashboard's browser-rendered assistant text. Every
+    direct caller of this pass is strict.
 
     Returns (cleaned_text, list_of_warnings).
     """
