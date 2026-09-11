@@ -111,6 +111,44 @@ allowlist), which is exactly why the corpus pins both verdicts.
 references no token that does not exist. A `var(--nope, #16213e)` fallback would
 otherwise always win and silently ignore the active theme.
 
+**The MCP App surface is a consumer of this token set.**
+`src/lib/mcpAppTheme.ts` maps the tokens onto SEP-1865's `McpUiStyleVariableKey`
+set and hands them to a null-origin app iframe as `hostContext.styles.variables`
+(the theming handoff, spec'd in
+[`docs/system-specs/modules/mcp-apps.md`](../../docs/system-specs/modules/mcp-apps.md)).
+So renaming a color role reaches this map too: `mcpAppTheme.test.ts` parses
+`ALLOWED_CSS_VARS` out of `themeCss.ts` and asserts every `--color-*` source in
+`COLOR_TOKEN_MAP` is a member, so a rename that misses the map fails a test rather
+than silently un-theming apps. Two reads there are **not** allowlisted tokens and
+are deliberate: `--font-body` (feeding `--font-sans`) and `--mono` (feeding
+`--font-mono`) are read as the host-fixed font defaults `buildCustomThemeCss`
+injects, so an installed pack's faces reach the app; they are the same host-fixed
+defaults called out above, not a theme-customizable per-color surface.
+
+**The four status roles map symmetrically**, and that is load-bearing. Every
+`--color-background-{info,success,warning,danger}` gets the `-subtle` wash; every
+`--color-text-*` / `--color-border-*` / `--color-ring-*` gets the strong hue. That
+keeps both pairings an app can build legible — strong hue on its own wash, and
+strong hue on `--color-background-primary`. A `-fg` token (`--info-fg`,
+`--danger-fg`, …) is the ink for a SOLID fill and is `#000` in most themes, so it
+never belongs on a `--color-text-*` key: `--color-text-info` read `--info-fg` once
+and rendered black-on-dark in every dark theme.
+
+**Where each wash comes from is not symmetric, and follows the dashboard.**
+`--ok-subtle`, `--warn-subtle` and `--danger-subtle` are stored per theme and are
+read directly. `--info` has no stored companion in the 56 — `bg-info-subtle` is
+derived in `tailwind.config.js` as
+`color-mix(in srgb, var(--info) 12%, transparent)` — so `COLOR_TOKEN_MAP` derives
+`--color-background-info` the same way, from `INFO_WASH` of the resolved
+`--info`, rather than adding a 57th variable to the customization surface. One
+wash, one definition: an app's info fill and the dashboard's own
+`bg-info-subtle` surfaces cannot drift into two visibly different washes of one
+hue, and `mcpAppTheme.test.ts` parses `tailwind.config.js` to keep the two
+percentages equal. A pack that wants a different info wash retunes `--info`,
+which moves both. Adding the stored token later is still open — the customization
+surface only ever grows safely, because a pack install REJECTS unknown keys and so
+cannot shrink.
+
 ## What is / isn't customizable
 
 | Tier | Surface |

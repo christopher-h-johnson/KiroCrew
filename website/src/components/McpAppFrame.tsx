@@ -9,6 +9,7 @@ import {
   buildAllowAttribute,
   type McpAppRenderPayload,
 } from '../lib/mcpAppSrcdoc'
+import { readMcpAppStyleVariables, themeContextKey } from '../lib/mcpAppTheme'
 import { planReveal, prefersReducedMotion, hasRevealed, markRevealed } from './mcpAppReveal'
 import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
 
@@ -146,6 +147,13 @@ function dimensionsFor(
   const width = presentation === 'overlay' ? overlayWidthPx() : wideWidth
   if (width && width > 0) dims.width = Math.round(width)
   return dims
+}
+
+/** `{ styles: ... }` when variables resolved, `{}` when not - spread into a
+ *  hostContext so an unresolved palette omits the key rather than sending an
+ *  empty object (requirement 1.6). */
+function stylesField(vars: Record<string, string> | null) {
+  return vars ? { styles: { variables: vars } } : {}
 }
 
 /**
@@ -371,16 +379,31 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
   const presentationRef = useRef<Presentation>(presentation)
   presentationRef.current = presentation
 
-  // The app styles itself from `hostContext.theme` alone: this host injects no
-  // CSS into the srcdoc (see mcpAppSrcdoc.ts), so a hardcoded value left every
-  // app dark regardless of the user's theme. `ResolvedMode` is already exactly
-  // 'dark' | 'light', so it maps 1:1 onto the protocol field.
+  // Theme reaches the app two ways, both over hostContext (this host still
+  // injects no CSS into the srcdoc — see mcpAppSrcdoc.ts). `theme` is the
+  // resolved 'dark' | 'light' mode, which maps 1:1 onto the protocol field and
+  // drives the app's `color-scheme`. Alongside it the host now sends
+  // `styles.variables` — the dashboard's own design tokens resolved for the
+  // active theme (see readMcpAppStyleVariables) — so an app paints in the user's
+  // palette rather than falling back to its own.
   //
   // Mirrored like `presentation` above because the bridge effect below closes
   // over `[]` — it must not re-subscribe when the theme changes.
-  const { theme } = useTheme()
+  const { theme, colorTheme, themeVersion } = useTheme()
   const themeRef = useRef(theme)
   themeRef.current = theme
+
+  // Re-resolve whenever the computed custom properties on documentElement can
+  // have changed. `themeVersion` is the signal `useTheme` maintains for exactly
+  // this: it bumps on mode change, color-theme change, an in-place theme-editor
+  // edit (same slug, new values), and `loadCustomThemes` completion — which is
+  // when an installed pack's CSS actually lands. `theme` and `colorTheme` alone
+  // would miss the last two. Same dependency triple as `WidgetFrame`'s
+  // `readThemeVars` memo.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const styleVars = useMemo(() => readMcpAppStyleVariables(), [theme, colorTheme, themeVersion])
+  const styleVarsRef = useRef(styleVars)
+  styleVarsRef.current = styleVars
 
   // --- `wide`: breaking out of the chat column -------------------------------
   // The frame's width ceiling is not its own: the transcript row wrapper caps it
@@ -548,6 +571,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
                 hostCapabilities: HOST_CAPABILITIES,
                 hostContext: {
                   theme: themeRef.current,
+                  ...stylesField(styleVarsRef.current),
                   platform: 'web',
                   displayMode: PROTOCOL_MODE[presentationRef.current],
                   availableDisplayModes: AVAILABLE_DISPLAY_MODES,
@@ -814,6 +838,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
           // Partial context update — only the changed fields, per spec.
           params: {
             theme: themeRef.current,
+            ...stylesField(styleVarsRef.current),
             displayMode: PROTOCOL_MODE[next],
             containerDimensions: dimensionsFor(next, wideWidth),
           },
@@ -832,15 +857,20 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
   // navigated-away guard and the wildcard-origin review annotation, and adding a
   // second would mean re-auditing a null-origin sandboxed target.
   //
-  // Compares against the last theme SENT rather than using a first-run flag:
-  // StrictMode remounts effects, and a boolean would post a spurious update on
-  // the second mount.
-  const sentThemeRef = useRef(theme)
+  // Compares the SERIALIZED theme half (theme + styleVars via themeContextKey),
+  // not `themeVersion`: that counter bumps on every `applyTheme` (a no-op
+  // re-apply included) and on every `loadCustomThemes`, so gating on it would
+  // post updates carrying identical values. Comparing what was last SENT is what
+  // makes a Color_Theme switch at constant mode fire while an identical palette
+  // does not — and it stays the compare-against-last-sent shape chosen over a
+  // first-run boolean because StrictMode remounts effects.
+  const sentThemeKeyRef = useRef(themeContextKey(theme, styleVars))
   useEffect(() => {
-    if (sentThemeRef.current === theme) return
-    sentThemeRef.current = theme
+    const key = themeContextKey(theme, styleVars)
+    if (sentThemeKeyRef.current === key) return
+    sentThemeKeyRef.current = key
     notifyHostContext(presentationRef.current, wideWidthRef.current)
-  }, [theme, notifyHostContext])
+  }, [theme, styleVars, notifyHostContext])
 
   // Host-initiated presentation change (the header controls).
   // The app MUST be told: it may gate an editable surface on the mode, and a
