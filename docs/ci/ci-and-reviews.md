@@ -24,7 +24,7 @@ pull_request
   |-- fast-gate.yml     "Fast Gate"    the 11 cheap blocking gates (~44s wall clock)
   |     |
   |     |-- ci.yml's `await-fast-gate` job releases the heavy jobs
-  |     '-- the five fork-*-review.yml lanes trigger on its completion
+  |     '-- the six fork-*-review.yml lanes trigger on its completion
   |
   |-- ci.yml            "CI"           lint, sharded tests, coverage gate, e2e
   |-- build.yml         "Build"        wheel + desktop artifacts still build
@@ -37,6 +37,8 @@ pull_request
   |-- ux-review.yml     "UX Review"         rendered experience, advisory
   |-- first-principles-review.yml
   |                     "First Principles Review"  why it exists, advisory
+  |-- security-scope-review.yml
+  |                     "Security Scope Review"  which legit ops a tightening refuses, blocking
   |-- CodeQL                                GitHub default setup, not a checked-in file
   |
   '-> pr-readiness.yml  "PR Readiness"  one commit status + one readiness: label
@@ -106,9 +108,6 @@ Out-of-band lanes that never gate a PR:
   call, and `test-durations.yml` already pays for a full suite on `main`.
   Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
-  `cleanup-temp-screenshots.yml` (prunes the ephemeral `temp-screenshots/` dir,
-  see [its README](../../temp-screenshots/README.md); safe because PR bodies
-  embed commit-SHA-pinned raw URLs that keep resolving),
   `test-durations.yml` (re-measures `.test_durations` so pytest-split's shards stay
   balanced by recorded runtime, and opens a PR with the update), `issue-triage.yml`
   (a model picks `type:` / `area:` / `platform:` labels from the repository's own
@@ -157,11 +156,11 @@ Out-of-band lanes that never gate a PR:
   handoff, not a loss: the job stays green and files/updates one issue titled
   "Add Contributor needs a human to open the contributors PR" carrying the compare
   link. The same limitation applies to every workflow here that opens a PR
-  (`test-durations.yml`, `cleanup-temp-screenshots.yml`, `memory-benchmark.yml`),
-  which carry the same guard in a lighter form: they emit a `::notice::` with the
-  compare link and exit 0 rather than filing an issue, because their branches are
-  regenerated on the next scheduled run and so do not need a durable tracker. Any
-  create failure that is NOT that refusal still fails the job in all four.
+  (`test-durations.yml`, `memory-benchmark.yml`), which carry the same guard in a
+  lighter form: they emit a `::notice::` with the compare link and exit 0 rather
+  than filing an issue, because their branches are regenerated on the next
+  scheduled run and so do not need a durable tracker. Any create failure that is
+  NOT that refusal still fails the job in all three.
   `test/test_workflow_pr_create_handoff.py` holds them in step and fails a new
   `gh pr create` step that skips the guard.
 
@@ -209,6 +208,7 @@ Widening that is a separate decision from moving the gates.
 | `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `testpaths-coverage` | `scripts/check_testpaths_coverage.py`, self-test first. Fails on a `test_*.py` file outside the roots `setup.cfg` pins in `testpaths` — such a file is never collected, so it is green by omission and rots against the code it claims to cover (#6577 found twelve). Whole-tree, since the backlog is zero |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
+| `memory-store-seam` | `scripts/check_memory_store_seam.py`, self-test first, with `MEMSTORE_BASE_REF` resolved to the diff base. Enforces explicit store selection on added memory-context calls. The prepare-pr floor runs both commands; the main ratchet lane classifies this as a diff-only gate because its whole-tree backlog is a non-failing report |
 | `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
 
 Each of these runs its own self-test in the same step, ahead of the real check. A
@@ -269,7 +269,7 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | `changes` | "Detect changed surface". Resolves the path filters every other job reads, so a diff that cannot affect a surface does not pay for it |
 | `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one that completes non-success. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
 | `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
-| `backend-test` | 4 duration-balanced pytest-split shards on Python 3.12, `-n auto` within each |
+| `backend-test` | 4 pytest-split shards on Python 3.12, `-n auto` within each; 50-minute job budget includes coverage upload, with the 120-second per-test timeout retained |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
@@ -462,7 +462,7 @@ design axis is **what each is allowed to read** (its prompt-injection surface) a
 | Opus 4.8 | `Opus 4.8 Review` | Agentic, `--max-turns 120` per stage, **two real invocations** (discovery -> validation) | **Code only**: `Read`, `Grep`, `Glob`, `Bash(gh pr diff:*)` | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
 | GPT 5.6 | `GPT 5.6 Review` | Non-agentic, **two** invocations (discovery, then authoritative falsification), `reasoning_effort: medium` | Code plus PR title and body as nonce-wrapped **UNTRUSTED** context | Line-level second perspective, plus description-versus-diff consistency (advisory) | Yes, fail-closed |
 | Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | Code plus `gh pr view` (it must judge intent) | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
-| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the committed screenshot PNGs **only**; pass 2: code, PR text, and pass 1's report | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
+| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the PR's screenshots **only** -- the attachments its body links, downloaded, plus any committed image; pass 2: code, PR text, and pass 1's report | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
 | First Principles | `First Principles Review` | Agentic Fable 5, same fallback, `--max-turns 120` (inventorying and counting is grep-heavy) | Code, the whole repository, and `gh pr view` | What is the author trying to do, and does each thing this ships *deserve to exist*, already exist, or only patch a symptom? | Advisory; red only on a genuine `BLOCK` |
 
 ### Why a first-principles lane is not a second Design Review
@@ -777,20 +777,31 @@ and fork PRs identically with no cross-workflow head-passing.
 ### `UX Review` early-skips cheaply
 
 It runs only when the diff touches `website/`, `temp-screenshots/**` or
-`.github/screenshots/**`. A backend, CI or docs PR skips it with no model call and no
-comment churn, and the check passes. When screenshots are present it reads each PNG
-and grounds visual findings in them, and it is instructed to treat screenshot content
-as untrusted (a screenshot, title, commit message or filename attempting to grant
-leniency is ignored, and screenshot polish never waives a lens).
+`.github/screenshots/**` (the last two are gitignored, so in practice `website/` is the
+trigger). A backend, CI or docs PR skips it with no model call and no comment churn,
+and the check passes. Review evidence is uploaded as a GitHub attachment, not
+committed: the author writes local paths in the PR body and runs
+`gh pr create|edit --attach <path>`, which rewrites each into a permanent
+`https://github.com/user-attachments/assets/...` URL (dragging the file into the
+description in the web UI yields the same URL). The lane reads the body from the API when
+it runs (`.github/scripts/pr-attachment-evidence.sh`, one script both UX lanes source;
+the fork lane takes it from its trusted base checkout), not from the event payload -- an `edited` event starts no review, so evidence
+attached after a push is read on a re-run of the workflow or on the next push -- downloads
+those URLs (a committed image is still accepted), reads each one and grounds visual
+findings in them, and it is instructed to treat screenshot content as untrusted (a
+screenshot, title, commit message or filename attempting to grant leniency is
+ignored, and screenshot polish never waives a lens). `screenshot-evidence.yml`, the
+gate that requires evidence on a UI diff, accepts the same URLs.
 
 ### `UX Review` reads the screenshots blind before it reads the diff
 
 On same-repo PRs the lane is two model calls with a context wall between them.
-**Pass 1 (blind read)** gets the `Read` tool and a list of the images the PR commits,
-copied under opaque names (`shot-01.png`, ...) so an author-chosen filename such as
-`pinned-turn-chip.png` cannot prime it -- and nothing else: no diff, no PR title or
-description, no `Grep`/`Glob`/`Bash`. It is told it is a non-technical person
-opening the product for the first time and
+**Pass 1 (blind read)** gets the `Read` tool and a list of the images the PR carries
+-- the `user-attachments` URLs linked from its body, downloaded to the runner, plus
+any image it commits -- copied under opaque names (`shot-01.png`, ...) so an
+author-chosen filename such as `pinned-turn-chip.png` cannot prime it -- and nothing
+else: no diff, no PR title or description, no `Grep`/`Glob`/`Bash`. It is told it is
+a non-technical person opening the product for the first time and
 writes down, per element, what it appears to be, what a click would do, how sure it
 is, and whether it would dare to click. **Pass 2 (reconcile)** gets the diff, the PR
 text and pass 1's report as a data file, and adjudicates rather than re-reads.
@@ -807,7 +818,8 @@ asked exactly that of a reviewer that was no longer uninformed, so it was replac
 Three rules follow from the split, all read off evidence rather than judged:
 
 - **Coverage.** Every user-visible control the diff adds or changes must appear in a
-  committed screenshot. One that does not is an *evidence gap*, listed under
+  screenshot the PR carries -- an attachment linked from its body, or a committed
+  image. One that does not is an *evidence gap*, listed under
   `### Evidence gaps`, and the verdict cannot be `PASS`. A diff that adds or changes
   no user-visible control has no gaps and needs no screenshot.
 - **Primary controls.** A control on the change's main path that the blind reader
@@ -825,16 +837,23 @@ Three rules follow from the split, all read off evidence rather than judged:
   with no stated reason is a `BLOCK`. Async lifecycle states (loading, empty, error
   -> content) are not in scope. The convention is also stated in `website/AGENTS.md`
   so authors meet it before the check does. Static screenshots cannot show
-  continuity, so this class of change needs a recording (a committed or PR-body
-  `.gif`/`.mp4`/`.webm`); none is an evidence gap. The reviewer cannot play the
-  recording -- it verifies the mechanism in the diff and that the recording exists,
-  and a human watches it.
+  continuity, so this class of change needs a recording (a `.gif`/`.mp4`/`.webm`
+  attached to the PR body, or committed); none is an evidence gap. The reviewer
+  cannot play the recording -- it verifies the mechanism in the diff and that the
+  recording exists, and a human watches it.
 
 The fork lane (`fork-ux-review.yml`) carries the same rules but has **no blind-read
-pass**: the fork head is never checked out, so the screenshots a fork PR adds are not
-on disk. It records every added or changed control as an evidence gap instead, which
-caps a fork UI change at `CONCERNS` (advisory). A maintainer who wants the blind read
-pushes the branch to this repository.
+pass**: it reviews in a single pass, after the diff. Its evidence step reads the PR
+description from the API and downloads the allowlisted `user-attachments` URLs onto
+the runner (the job's egress allowlist names the two hosts a download touches,
+`github.com` and the `github-production-user-asset-6210df.s3.amazonaws.com` bucket
+its 302 points at), so the reviewer
+opens the same images a same-repo review would. An image a fork PR *commits* is not
+on disk -- the fork head is never checked out -- so a control shown only there is an
+evidence gap, which caps that PR at `CONCERNS` (advisory). A maintainer who wants
+the blind read pushes the branch to this repository. A fork contributor without push
+access cannot run `gh --attach`; dragging the file into the PR description in the web
+UI yields the same `user-attachments` URL.
 
 The PR identity (number, repository, shas, data-file paths) is passed to both passes
 in `--append-system-prompt`, not in `prompt:`. GitHub rejects a workflow file
@@ -847,8 +866,10 @@ silently (zero jobs, nothing on the PR) when any expression-bearing string excee
 `ai-review-human-override.yml` lets a repository **writer** record a judgment with:
 
 ```
-/ai-review override <fable|gpt|all> <current-head-sha>: <one-sentence reason>
+/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha>: <one-sentence reason>
 ```
+
+`scope` targets the [Security Scope Review](#security-scope-review-what-a-tightening-newly-refuses) lanes; every target maps to its like-named reviewer.
 
 `issue_comment` workflows execute from the trusted default branch, never from the PR
 head. The handler validates the command shape, a 7-to-40-hex SHA that must be the
@@ -872,6 +893,144 @@ freshness checks, and `test_fable_consumes_only_a_bot_authored_sha_scoped_record
 `test_gpt_has_clear_verdict_banner_and_human_override` for the consumer side, so an
 untrusted PR comment or a decision for an earlier push cannot turn a gate green.
 
+## `Security Scope Review`: what a tightening newly refuses
+
+A security fix is almost always a deny rule made stricter, and "stricter" has a
+cost no reviewer sees by reading the pattern: the set of ordinary operations the
+tightened rule *also* newly refuses — a read-only `gh` query, a feature-branch
+push, an installed cron. This lane names them. It asks one question — which
+legitimate operations does this change newly refuse? — and answers it against the
+real deny composite at the base ref and at the head ref, on macOS, Linux and
+Windows.
+
+It does **not** judge whether the fix is secure enough, and it does not replace
+the [denial-differential gate](denial-differential.md). The denial differential
+classifies a committed corpus of known golden paths; this lane has a model
+**propose** candidate legitimate operations the corpus does not yet name, and
+`scripts/deny_diff.py` **decides** each one by classifying it at both refs. Model
+proposes, script decides: a candidate is data the classifier reads, never an
+operation it runs, so a confirmed regression is the script's finding and never the
+model's.
+
+It runs on two surfaces. `.github/workflows/security-scope-review.yml` is the
+same-repo lane. `.github/workflows/fork-security-scope-review.yml` gives a fork PR
+the same review from the trusted base branch, triggered by the completion of
+`Fast Gate` and gated on `head_repository.full_name != github.repository`, and it
+posts under the same check name so branch protection is satisfied on either path.
+
+### Scope
+
+The lane runs only when the change touches the security surface: the deny
+composite's own modules (`src/kiro_crew/security/`, `src/kiro_crew/hooks.py`,
+`src/kiro_crew/deny_guidance.py`,
+`src/kiro_crew/platform/security_authority.py`), the security-conductor's
+`rules-of-engagement.json` and `golden-paths.json`, and the lane's own harness
+(`scripts/deny_diff.py`, `scripts/scope_candidates.py`, `scripts/scope_redact.py`,
+`.github/review-prompts/security-scope.md`, and this workflow). A tightening can
+also live outside those paths, so the `security-scope-review` label forces the
+lane on. The surface list is a sentinel-delimited array in the same-repo workflow,
+and the fork lane reads that one array from the base commit, so the two lanes
+scope one surface rather than two that drift. A change that touches nothing on the
+surface and carries no label resolves "nothing to scope" and passes.
+
+### Four jobs, split by what each may hold
+
+The job graph is `generate` → `validate` → `adjudicate` → `publish`, and the split
+is a trust boundary: the job that holds the Bedrock credential runs no repository
+Python, and the job that can write a comment runs only base-committed harness.
+
+| Job | Holds | Runs | Platform |
+|---|---|---|---|
+| `generate` | the Bedrock credential (`id-token: write`) | Fable 5, which proposes `candidates.json` reading with `Read` / `Grep` / `Glob` | ubuntu |
+| `validate` | `contents: read` | `scope_candidates.py validate`, which proves the model's file is a corpus the differential can consume | ubuntu |
+| `adjudicate` | `contents: read` | `deny_diff.py`, classifying each candidate at the base ref and the head ref | ubuntu, macOS, windows |
+| `publish` | `pull-requests: write` | the fold and comment assembly, staged from the base commit | ubuntu |
+
+The model is `us.anthropic.claude-fable-5`, with `us.anthropic.claude-opus-4-8` as
+the overload fallback. `generate` mints the credential but runs no repository
+Python, so a prompt injection reaches no product code. `validate` and `adjudicate`
+execute the change's own harness — `adjudicate` materializes each ref's own
+`kiro_crew.security` into its own directory and classifies against it in a child
+process — but hold no credential and no write token, so a judge supplied by the
+change under judgement decides nothing worth stealing. `publish` holds the only
+write token and reads every program it runs out of a committed base-commit blob,
+so the change under review cannot supply the code that folds its own verdict.
+`adjudicate`'s legs do not fail-fast: one platform's regression is not evidence
+about another's, and the path fence's home-directory ordering and the argv
+tokenizer differ per OS.
+
+### The verdict, and why it fails closed
+
+The review emits `[SCOPE-REVIEWED] <sha>` and a `Scope-Verdict: PASS | CONCERNS |
+BLOCK` header. The header is the model's opinion and never a gate on its own. The
+gate is the differential: a script-confirmed newly-refused operation reds the lane
+whatever the model wrote. A model `BLOCK` with no confirmed regression scores
+CONCERNS unless it stands on a demonstrated platform gap; a clean fold with a
+`PASS` header and a marker for this head passes.
+
+Every outcome that could not settle a verdict — a fold that errored, a confirmed
+row that had to be redacted, a platform leg that never reported, or a review that
+left no `[SCOPE-REVIEWED]` marker for this head — routes through one constant,
+`_UNSETTLED_CONCLUSION` in `scripts/scope_candidates.py`. It is the strict value,
+and both lanes map it to a **failing check**. That is the fail-closed contract:
+"could not run" and "found nothing" are the same badge to a reader, so they must
+not be the same exit code — an unmeasured tightening must not read as "nothing
+newly refused". The conclusion table lives in one place,
+`scope_candidates.py conclude`, which both lanes call, so a fork can never resolve
+more permissively than same-repo.
+
+**That strict value is a ruling, not a default.** Fail-closed was chosen over
+resolving neutral, with the cost named: a Bedrock outage or one flaky matrix leg
+reds the lane on a PR whose scope may be fine. On a fork PR a re-run clears it: a
+run that could not measure marks its own check-run unsettled (a
+`[scope-floor:unsettled]` prefix on `output.title`), so the per-head floor does
+not stand behind that run and a later clean run publishes clean. On a same-repo
+PR the floor's state is the publish job's own check-run conclusion, which the run
+cannot mark, so a re-run alone cannot clear a prior flake there — the escape is
+the SHA-scoped `/ai-review override scope <sha>`, which bypasses the floor. It is
+worth paying on three grounds. It is the failure this lane exists to catch, so the lane
+must not commit it about itself. Its blast radius is bounded to the population that
+needs the strictness — `generate` resolves `in_scope=false` for a change outside the
+security surface, and every step that mints a credential or calls the model is gated
+on that answer, so an off-surface PR spends no Bedrock call and completes green
+without a model verdict. It is not a workflow-level skip: the cheap deterministic
+steps still run, which is deliberate, because a lane reporting `skipped` is read as
+"the review has not posted yet" and waited on. What the gate buys is that the two
+failure sources this ruling is about — an outage and a flaky matrix leg — cannot red
+a PR the lane would not have judged. And
+it matches `Opus 4.8 Review` and `GPT 5.6 Review`, both fail-closed in the table
+above; a security lane resolving softer than them would be the weakest link in the
+same rollup. To reverse the ruling, set `_UNSETTLED_CONCLUSION = "concerns"` — one
+constant, no other edit, both lanes already map `concerns` to a non-blocking
+neutral. That stays one constant on purpose: `conclude` reports `settled=no` by
+comparing against the constant rather than against a token spelling, so the fork
+lane keeps marking unsettled runs after a flip instead of silently treating them as
+measured. The same-repo floor is indifferent to the value — its state is the job's
+own conclusion, and any non-`success` prior floors the head — so `/ai-review
+override scope <sha>` remains that lane's escape either way.
+
+### When it goes red
+
+Read the lane's comment. Each row is an operation the classifier confirms `<sha>`
+newly refuses, with the tier that refused it and the refusal text. Narrow the rule
+so it no longer catches the row. A human who has judged the scope acceptable by
+hand records `/ai-review override scope <current-sha>: <reason>` on the same-repo
+lane.
+
+**A fork PR's override does not clear this lane yet**, and that is a gap rather than
+a rule. The fork lane consumes no override marker today, so a scope judged acceptable
+on a fork clears only by re-raising the change from a branch in this repository —
+where the same-repo lane does honour the override — or by a maintainer with admin
+rights dismissing the required check. It is worth being exact about why, because the
+lane used to claim a threat it does not have: the marker is posted by
+`ai-review-human-override.yml` as `github-actions[bot]` after that workflow checks the
+commenter's write permission, and the same-repo lane authenticates it by that bot
+login on this repository's own comment feed, read with this repository's token and
+pinned to one head SHA. Nothing in that chain depends on the pull request being
+same-repo. Reading it on the fork lane is missing work, tracked in #10109, not a
+door held shut. A *transient* failure needs none of this: such a run marks its own
+check-run `[scope-floor:unsettled]`, sets no per-head floor, and clears on a re-run.
+
 ## `pr-readiness.yml`: the aggregator
 
 It executes no tests. It resolves the PR's current head SHA, **drops stale events**,
@@ -886,7 +1045,8 @@ commit status plus one `readiness:` label**.
   whose base is not the default branch it never starts, and a monitored lane that
   reads `(not started)` would freeze the verdict at pending forever.
 - **Additionally required on a same-repo PR:** CodeQL, Opus 4.8 Review, GPT 5.6
-  Review, and completion of Design Review, UX Review and First Principles Review.
+  Review, Security Scope Review, and completion of Design Review, UX Review and
+  First Principles Review.
 - **UX Review and First Principles Review are completion-required but advisory:**
   once complete they score as `"(advisory)"` whatever their conclusion, so neither
   their opinion nor an infrastructure failure becomes an independent blocker.
@@ -896,9 +1056,19 @@ commit status plus one `readiness:` label**.
   because the lane fails its own check *only* on a `BLOCK` verdict — an errored,
   throttled or verdict-less run exits 0 — so a `failure` here can only mean a
   design judged wrong, never infrastructure noise.
-- **CodeQL is not a checked-in workflow.** It runs via GitHub default setup and is
-  resolved by `path == "dynamic/github-code-scanning/codeql"`. `skipped` counts as
-  passed for it.
+- **Security Scope Review is required and fails closed:** the aggregator scores
+  its `failure` as a plain blocker, because that conclusion covers both a
+  script-confirmed newly-refused operation and a run that measured nothing — an
+  errored fold, a missing head marker, or a platform leg that never reported.
+  It is deliberately not relabelled `(BLOCK)` the way Design Review is, because
+  a `failure` here does not always mean a verdict was reached.
+- **CodeQL is not a checked-in workflow.** It runs via GitHub default setup. The
+  aggregator first resolves the analysis run by
+  `path == "dynamic/github-code-scanning/codeql"`, then reads the exact head SHA's
+  `CodeQL` check from the `github-advanced-security` app. A successful analysis
+  run does not mask a failed security result. An absent, running, or interim
+  neutral result remains `checking`; `skipped` still counts as passed for the
+  managed workflow.
 - **Labels:** `readiness: checking` (pending), `readiness: action required` (a
   blocker), `readiness: passed`. Exactly one is ever present.
 - **It also enforces the disposition rule.** Besides scoring lanes, readiness runs
@@ -1045,12 +1215,14 @@ protection remain separate gates.
 
 **The `fork-*` pipeline gives fork PRs AI review anyway, in two stages.**
 `fork-opus-review.yml`, `fork-gpt-review.yml`, `fork-design-review.yml`,
-`fork-ux-review.yml` and `fork-first-principles-review.yml` each trigger on the
+`fork-ux-review.yml`, `fork-first-principles-review.yml` and
+`fork-security-scope-review.yml` each trigger on the
 **completion of `Fast Gate`** (stage 1) and run privileged from the default branch
 (stage 2), gated on
 `workflow_run.head_repository.full_name != github.repository`. Each posts a check-run
 named exactly like its same-repo twin (`Opus 4.8 Review`, `GPT 5.6 Review`,
-`Design Review`, `UX Review`, `First Principles Review`), so branch protection is
+`Design Review`, `UX Review`, `First Principles Review`, `Security Scope Review`),
+so branch protection is
 satisfied on either path, and it opens that check-run as early as possible keyed to
 `head_sha` so a job that dies still leaves a fail-closed result.
 
@@ -1209,7 +1381,7 @@ permission can record a false-positive, not-applicable, or accepted-risk
 decision with:
 
 ```text
-/ai-review override <fable|gpt|all> <current-sha>: <reason>
+/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-sha>: <reason>
 ```
 
 The decision is intentionally explicit and commit-scoped. The handler resolves
@@ -1288,10 +1460,15 @@ or ruleset setting outside the workflow.
 
 The aggregate covers the latest PR run for CI, Build,
 Code Review, Opus 4.8 Review, GPT 5.6 Review (the reconciled result of its three
-calls), and Design Review, plus the managed dynamic CodeQL workflow conclusion.
-Grading the CodeQL
-workflow conclusion, rather than its neutral summary check, preserves failures
-from any managed Analyze job. Fork PRs cannot receive repository secrets or
+calls), Security Scope Review, and Design Review. For managed CodeQL it requires
+both the dynamic analysis workflow and the exact-head `CodeQL` security result
+published by the
+`github-advanced-security` app. This preserves failures from an Analyze job and
+also prevents a successful analysis workflow from masking alert-driven failure.
+Default setup can publish a neutral interim result before every configured
+language reports; that state remains `checking` and the existing stale-pending
+sweep requests another evaluation if no workflow event follows the final result.
+Fork PRs cannot receive repository secrets or
 OIDC credentials, and this repository's managed default-setup CodeQL workflow
 is not scheduled for fork heads. The secret-backed AI reviews therefore run for
 forks from the trusted base branch via the `fork-*` pipeline and are graded from

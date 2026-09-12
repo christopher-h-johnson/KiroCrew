@@ -4,6 +4,27 @@
 
 The CLI module (`kiro_crew/cli.py`) provides the `kirocrew` command using stdlib `argparse`.
 
+## Member memory commands
+
+`kirocrew agent create --name <name>` allocates the member's own empty private V2
+memory automatically. `--memory-store` is a compatibility field accepting only
+empty/default on create, or the unchanged identity on update; it cannot share or
+rebind a member's memory. Legacy members initialize an empty private store with
+`kirocrew agent update <name> --provision-memory`. Valid existing Global and named
+V1 bindings remain usable, including a member configured as `default_agent`, until
+the owner explicitly selects V2. This opt-in starts empty and preserves V1 data.
+Ordinary V1 initialization can add shared metadata and revision tables; it does
+not convert V1 into private memory. See the [memory contract](memory-skills-hooks.md).
+
+`kirocrew doctor` checks every configured member's memory binding, reports the
+member, configured store and refusal reason, and continues checking other members
+after a failure. The binding check neither initializes databases nor provisions,
+rebinds or repairs stores. A valid binding does not establish full database health
+or private execution capability. Normal CLI configuration loading and data-home
+setup still apply. SQLite identity reads can create transient WAL coordination
+files; they preserve the database and any committed WAL content. Damaged private
+ownership cannot be repaired by silently substituting Global V1.
+
 ## Import Weight Contract
 
 `cli.py` is the shared dispatcher for every subcommand — including the
@@ -242,6 +263,9 @@ path gives up is ancestor-swap resistance, not link resistance.
 | `kirocrew memory list/search/stats/audit` | Inspect vector memory (entries, semantic search, counts, suspicious-content scan) |
 | `kirocrew memory show [preferences\|projects\|history]` | Read the markdown memory layer (all three when no target given); `--format md\|json`, `--since YYYY-MM-DD` for history |
 | `kirocrew memory export/import/migrate` | Export memory to JSON (`--include-markdown` adds the markdown layer), import it back, or migrate legacy markdown memory into the vector store |
+| `kirocrew memory backup/backups/restore` | Take hot copies of Global, declared named V1 and actively owned V2 stores (`--keep <n>`), list a store's copies newest-first (`--store`), or stage a restore (`--store`, `--from <file>`, defaulting to that store's newest). Both V1 and V2 activate restoration at gateway restart. Archived V2 stores are excluded from routine backups. `restore --store <member-store> --cancel-pending` cancels a staged intent while preserving current memory and its backup; it is mutually exclusive with `--from`. A failed activation still requires restart after cancellation. All three dispatch BEFORE the shared vector store is opened, because opening it raises on exactly the corrupt file these verbs recover. See [memory-skills-hooks](memory-skills-hooks.md#automatic-backups-memory_backuppy) |
+| `kirocrew memory retired` | List the episodes a semantic write superseded and restore one (`--restore <id>`, `--limit`). Default store only — it has no `--store`, so restoring a retirement inside a silo is a dashboard action. See [memory-skills-hooks](memory-skills-hooks.md#supersession-retirement-and-why-it-is-bounded) |
+| `kirocrew memory carve --store <name>` | Filter or count a crew store's rows by their carve facets: one flag per facet (`--scope/--surface/--crew/--session-key/--derived-from`), `--kind`, `--count-by <axis>` for grouped counts, `--limit`/`--offset`. Facets exist only on a crew memory store, so the default store answers with a named refusal rather than an empty list. See [memory-skills-hooks](memory-skills-hooks.md#who-reads-a-facet) |
 | `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
 | `kirocrew pod up/down/ls/status/token/url/scenarios/api/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
 | `kirocrew pod scenarios [--json]` | List packaged seed scenarios in deterministic name order. Human output shortens each description to the last complete sentence that fits, cutting between words with an ellipsis when none does; `--json` emits an array of `{name, description}` rows with each fixture manifest's complete `description:` scalar; literal (`|`) blocks preserve newlines, while folded (`>`) blocks normalize to one paragraph. Extraction stays dependency-free without requiring PyYAML at runtime. An empty registry returns success with `[]` in JSON mode or an explicit human diagnostic. |
@@ -252,6 +276,7 @@ path gives up is ancestor-swap resistance, not link resistance.
 | `kirocrew knowledge stats [--json]` | Count the knowledge library: sources, documents and items in total and per source. Read-only: it opens the database with SQLite `mode=ro` (`KnowledgeStore.open_read_only`), so it never runs the constructor's schema migration or orphan sweep, and a library behind the schema is reported, not migrated. There is deliberately no flush/rebuild/repair verb beside it. Its LLM-facing twin is `knowledge_list_sources`, which renders the same `aggregate_stats()` call (see [knowledge](knowledge.md) §6 and [mcp](../../architecture/mcp.md) § The MCP-first rule) |
 | `kirocrew cron preview <script>` | Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered |
 | `kirocrew workspace create/update --dir <name>` | `--dir` is a directory NAME that must resolve to a **strict descendant of the data home** (`~` is expanded first); anything landing outside — and the home **root itself**, in any spelling — is refused with a SEL `denied` audit event. Containment, not an absolute-path ban: an absolute path *under* the home resolves where the relative form would and is accepted. The strict-descendant test is what closes the root case for tilde paths, since the per-call-site root-equality checks compare un-expanded `config_dir() / ws_dir`. Deliberately stricter than the dashboard's `POST /api/workspaces`, which accepts an absolute `dir` anywhere, screened by `is_sensitive_path`. |
+| Workspace directory materialization | The declared directory must EXIST once the entry is committed: `_private_memory_layout` resolves **every** declared workspace with `strict=True`, so one entry naming a missing directory refuses **every** private member, including members bound to other workspaces. **Create** therefore materializes it — one atomic `mkdir` immediately before the config write, in the same locked section, made relative to the **pinned** parent (`pinned_fs` discipline: each parent component is opened `O_NOFOLLOW` from the path as validation resolved it, so a component swapped for a link between validation and the mkdir is refused rather than followed; where the platform cannot pin, Windows, the create is by name). An existing **directory** is adopted (pointing a new workspace at a folder the owner already keeps is supported, and is the normal case for an absolute `dir`); a path that exists and is **not** a directory is refused, as is a missing **parent**, rather than fabricating a tree. The created directory is **not** rolled back when the config write fails: it is reachable only through the entry written in that same section, so a failure leaves an empty directory nothing references, and deleting it would race a concurrent create that has adopted and registered the same path. The same rule holds for a `--copy-from` create whose config write fails after the copied tree was installed: the tree is left in place and its path is reported (CLI stderr note; handler warning log), because a concurrent create can already have adopted and registered it and deleting it would leave that workspace declared with no directory. **Update** does the opposite half: it REFUSES a `dir` that is missing or is not a directory (`workspace_dir_unusable`; CLI exit 1) instead of creating one, because it names a destination the owner already chose and its transaction carries no rollback. Consequence: "rebind first, create the folder after" is no longer a valid sequence — create makes its own directory, update binds one that exists. The fleet-wide shape of that refusal is deliberate: the reader is a fail-closed isolation snapshot, so one unresolvable declared entry stops every private member rather than only the members bound to it, and the fix belongs at the writers. Residual, tracked in #10156 rather than chased here: writers that reach the `workspaces` section without going through these two commands (`config set --file`, `config edit`, a backup restore) can still commit an entry naming a missing directory and arm the same refusal. |
 | `kirocrew computer doctor [--json]` | Report computer-use availability: platform support, the keystone primary-enable state, and the **advisory** macOS Accessibility / Screen Recording probe with a `responsible_hint`. See [Computer Use Commands](#computer-use-commands). |
 | `kirocrew computer apps` | List on-screen applications the accessibility layer can address (human-facing twin of the `computer_list_apps` MCP tool). Gated by the same chokepoint as `call` — refused while the feature is off or the session is unattended. |
 | `kirocrew computer call <tool> [k=v ...]` | Run ONE computer-use tool through the same gated chokepoint the agent uses, and print its reply (debug / reproduction) |
@@ -1290,7 +1315,12 @@ non-destructive way to apply it.
 ## Status Command
 
 `kirocrew status` queries the running gateway's `/api/status` endpoint
-and prints uptime, sessions, messages, tool calls, subagents, crons, lessons.
+and prints uptime, sessions, messages, tool calls, subagents, crons, lessons,
+and a memory line: the gateway's own resident set (`gateway_rss_mb`) and the
+per-session tree ceiling the cleanup watchdog recycles at
+(`watchdog_rss_max_mb`, spelled out as disabled when `0`). Both fields are
+published by `/api/status` for this line; `kirocrew doctor` prints the same two
+readings at the top of its Memory Pressure section, on every platform.
 
 ## App Dev Mode
 

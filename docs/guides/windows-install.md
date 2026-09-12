@@ -5,6 +5,12 @@ The cross-platform process / signal / file-lock / metrics behavior is routed
 through `kiro_crew.platform_compat`, so macOS + Linux behavior is unchanged and
 the same code path also runs on Windows.
 
+Existing Memory V1 members remain usable on native Windows. New members require
+private Memory V2, so creation and explicit V1-to-V2 setup refuse before writing
+private files on a native Windows gateway. Use a WSL/Linux gateway with Crew's
+namespace sandbox and a supported member backend for those operations. Viewing
+and managing an already-owned V2 store remains available from the owner dashboard.
+
 ## Desktop installer
 
 CI's Windows lane (`build-windows.yml`) builds a Windows desktop app: an NSIS
@@ -538,7 +544,7 @@ POSIX fleet too, where the Windows branches never execute.
 
 ## The RSS-recycle ceiling measures real trees on Windows
 
-`session.watchdog_rss_max_mb` (opt-in, `0`/disabled by default) recycles a
+`session.watchdog_rss_max_mb` (default 1536 MiB; `0` disables) recycles a
 non-busy session whose process tree exceeds the ceiling. Its measurement is
 `/proc`-based, so `get_session_rss_mb` measured every tree as 0 MiB on Windows:
 the ceiling an operator had configured could never be reached and no session was

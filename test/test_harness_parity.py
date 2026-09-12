@@ -31,6 +31,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
@@ -45,18 +46,22 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_CODEX,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
+    PROVIDER_LABEL_OPENCODE,
 )
 from kiro_crew.acp_backends import (
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_PRIVATE_MEMORY_MCP,
+    ACP_BACKENDS_SIDE_READONLY,
     BASELINE_SELECTABLE_BACKENDS,
     selectable_backends,
 )
 from kiro_crew.agent_sdk import backends as acp_backends
 from kiro_crew.config.loader import AgentConfig, _normalize_acp_backend
 from kiro_crew.providers import acp as providers_acp
+from kiro_crew.providers import mirrors
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GATE_PATH = os.path.join(_REPO_ROOT, "scripts", "check_harness_parity.py")
@@ -348,6 +353,8 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("ACP_BACKENDS_ACP_RUNTIME", ACP_BACKENDS_ACP_RUNTIME),
         ("ACP_BACKENDS_COMPACT", ACP_BACKENDS_COMPACT),
         ("ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD", ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD),
+        ("ACP_BACKENDS_PRIVATE_MEMORY_MCP", ACP_BACKENDS_PRIVATE_MEMORY_MCP),
+        ("ACP_BACKENDS_SIDE_READONLY", ACP_BACKENDS_SIDE_READONLY),
         ("ACP_BACKENDS_STRUCTURED_REFUSAL", ACP_BACKENDS_STRUCTURED_REFUSAL),
         ("ACP_BACKENDS_HOST_AUTH_CALLBACK", ACP_BACKENDS_HOST_AUTH_CALLBACK),
     ):
@@ -413,6 +420,7 @@ def test_every_known_backend_has_a_label() -> None:
         ACP_BACKEND_CLAUDE: PROVIDER_LABEL_CLAUDE,
         ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
         ACP_BACKEND_CODEX: PROVIDER_LABEL_CODEX,
+        ACP_BACKEND_OPENCODE: PROVIDER_LABEL_OPENCODE,
     }
     assert set(labels) == set(ACP_BACKENDS_KNOWN), (
         "a known backend has no PROVIDER_LABEL_* of its own, so it would persist "
@@ -420,6 +428,32 @@ def test_every_known_backend_has_a_label() -> None:
         "providers.acp.provider_label"
     )
     assert len(set(labels.values())) == len(labels), "two backends share a label"
+
+
+def test_opencode_is_selectable_and_answerable() -> None:
+    """H1/H8: offered only because the build can answer for it, on two counts.
+
+    Asserted TOGETHER, like the codex pairing below, because either half alone is
+    the state the pairing exists to prevent. Without the install probe a failed
+    session arrives with nothing to act on; without ENFORCED routing the switch
+    offers a harness whose tool calls would not reach the host gate -- and this
+    harness's own permission default is permissive, so that second half is not
+    hypothetical.
+    """
+    from kiro_crew.agent_sdk import tool_gate
+    from kiro_crew.agent_sdk.backend_install import _PROBES
+
+    assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_KNOWN
+    assert ACP_BACKEND_OPENCODE in BASELINE_SELECTABLE_BACKENDS
+    assert ACP_BACKEND_OPENCODE in selectable_backends()
+    assert ACP_BACKEND_OPENCODE in _PROBES, (
+        "opencode is offered in the switch, so backend_install must be able to say "
+        "what is missing when a session fails to start"
+    )
+    assert tool_gate.is_enforced(ACP_BACKEND_OPENCODE), (
+        "opencode is offered in the switch, so its routing must be one this core "
+        "enforces -- its own permission default asks for nothing"
+    )
 
 
 def test_codex_is_selectable_and_answerable() -> None:
@@ -563,7 +597,15 @@ def test_codex_spawn_keeps_its_own_branch() -> None:
     assert "_is_codex" in spawn_source
     assert "_resolve_codex_acp_bin" in spawn_source
     assert acp_client.PROTOCOL_VERSION_CODEX is not None
-    assert "PROTOCOL_VERSION_CODEX" in inspect.getsource(acp_client.AcpClient._initialize_session)
+    # Its OWN literal, read from the per-harness table the handshake looks up. The
+    # table is what keeps the shared handshake free of adapter conditionals (H13);
+    # the entry being codex's own name rather than claude's is what keeps a future
+    # divergence a one-row edit rather than a silent downgrade (H10).
+    table = acp_client._PROTOCOL_VERSION_BY_BACKEND
+    assert table[ACP_BACKEND_CODEX] is acp_client.PROTOCOL_VERSION_CODEX
+    assert "_PROTOCOL_VERSION_BY_BACKEND" in inspect.getsource(
+        acp_client.AcpClient._initialize_session
+    )
 
 
 def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
@@ -587,15 +629,23 @@ def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
         assert "if self._is_claude" in source, f"{fn.__name__}: claude seam spliced ungated"
 
 
-def test_codex_mcp_seam_defaults_to_empty() -> None:
-    """The public core sends no mcpServers for codex, exactly as for claude.
+def test_codex_mcp_seam_projects_through_its_mirror() -> None:
+    """The seam is FILLED, and it fills from the mirror rather than from itself.
 
-    kiro-cli receives its servers through ``--agent``; an edition overrides the seam.
-    A non-empty default here would put servers on a public session that the adapter
-    was never configured for.
+    An empty array is byte-identical for kiro-cli (``--agent`` carries its
+    servers) and a real gap for codex: the adapter reads no spec of Crew's, so a
+    selectable public backend would serve sessions with no ``spawn_run``, no
+    ``cron_add``, no ``send_message`` and no error anywhere.
+
+    What this pins is WHERE the array comes from. A translator written here rather
+    than in ``providers/mirrors/codex.py`` is the shape the mirror folder exists to
+    stop: one per-harness override per author, each rediscovering the same
+    projection.
     """
-    client = acp_client.AcpClient.__new__(acp_client.AcpClient)
-    assert client._codex_session_mcp_servers() == []
+    source = inspect.getsource(acp_client.AcpClient._codex_session_mcp_servers)
+    assert "self._session_mcp_servers()" in source
+    assert acp_backends.ACP_BACKEND_CODEX in acp_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert mirrors.mirror_for(acp_backends.ACP_BACKEND_CODEX) is not None
 
 
 def test_model_preflight_allows_unknown_advertised_set() -> None:

@@ -65,6 +65,7 @@ from kiro_crew.history import (
     transcript_sort_key,
     update_metadata_off_loop,
 )
+from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -791,6 +792,70 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
         slot.messages[-1]["variant_idx"] = m.get("variant_idx", 0)
 
 
+def _pin_private_agent_assignment(
+    session_key: str,
+    agent: str,
+    config: KiroCrewConfig,
+    *,
+    conversation_log=None,
+    native_context: bool = False,
+) -> str:
+    """Pin an owner-selected member, never a name recovered from history.
+
+    Callers must positively authorize the owner request before using this
+    helper. Legacy members keep their declared V1 memory until owner opt-in.
+    """
+    selected = agent or config.default_agent
+    if selected == "default":
+        return ""
+    member = config.agents.get(selected)
+    store = getattr(member, "memory_store", "")
+    if not store:
+        return ""
+    record = config.memory_stores.get(store) if isinstance(store, str) else None
+    if record is None or record.memory_version != 2:
+        return ""
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    store = require_member_memory_store(config, selected)
+    log = conversation_log if conversation_log is not None else ConversationLog()
+    if read_private_session_store(session_key) is None and (
+        native_context or log.has_log(session_key)
+    ):
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        raise UnknownMemoryStore(
+            "This conversation retains its V1 history. Open a new conversation for private memory."
+        )
+    bind_private_session_store(session_key, store)
+    return store
+
+
+async def pin_private_agent_store(
+    state: DashboardState, session_key: str, agent: str, config: KiroCrewConfig
+) -> str:
+    """Run :func:`_pin_private_agent_assignment` off the loop for one slot.
+
+    ``native_context`` is whether the session already has a live or resumable
+    provider: such a session carries V1 context no transcript row shows yet.
+    Callers snapshot the slot before awaiting and re-compare afterwards; this
+    helper only owns the file IO hop and the probe.
+    """
+    return await asyncio.to_thread(
+        _pin_private_agent_assignment,
+        session_key,
+        agent,
+        config,
+        conversation_log=state.conversation_log,
+        native_context=(
+            state.sessions.get_provider(session_key) is not None
+            or bool(state.sessions.resumable_sid(session_key))
+        ),
+    )
+
+
 def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     """Resolve a member slot's restore identity from its binding.
 
@@ -810,7 +875,7 @@ def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     prefix = members_mod.DM_SLOT_KEY_PREFIX
     if not slot_name.startswith(prefix):
         return None
-    binding = members_mod.read_dm_binding(slot_name[len(prefix) :])
+    binding = members_mod.read_dm_binding_for_slot(slot_name)
     member = (binding or {}).get("member", "")
     if not member:
         logger.warning(
@@ -967,6 +1032,7 @@ def _rehydrate_slot_from_history(
         # Legacy metadata has no ``created_at``: record the observation
         # itself so the guard's missing-file witness still fires for it.
         slot._disk_meta_observed = bool(meta)
+        slot._memory_assignment_from_history = True
         # Member keys keep the binding-derived agent/mode: transcript metadata
         # is the operator-editable file the pin must not re-derive from.
         if meta.get("agent") and _member_identity is None:
@@ -995,6 +1061,8 @@ def _rehydrate_slot_from_history(
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
+        if meta.get("memory_store"):
+            slot.memory_store = str(meta["memory_store"])
         if meta.get("project"):
             slot.project = meta["project"]
         # Restore the remote executor marker INDEPENDENTLY of its target fields.
@@ -1532,6 +1600,7 @@ def _apply_recent_session(
     # Legacy metadata has no ``created_at``: record the observation itself so
     # the guard's missing-file witness still fires for it.
     slot._disk_meta_observed = bool(meta)
+    slot._memory_assignment_from_history = True
     # Member keys keep the binding-derived agent/mode: transcript metadata is
     # the operator-editable file the pin must not re-derive from.
     if meta.get("agent") and _member_identity is None:
@@ -1557,6 +1626,8 @@ def _apply_recent_session(
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
+    if meta.get("memory_store"):
+        slot.memory_store = str(meta["memory_store"])
     if meta.get("project"):
         slot.project = meta["project"]
     if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
@@ -1984,25 +2055,60 @@ _entry_cache: OrderedDict[str, tuple[dict | None, int]] = OrderedDict()
 _entry_cache_bytes = 0
 
 # Lazily resolved ``(max_entries, max_bytes)`` for the entry cache. Resolved
-# once per process and then served from this module global: the builder runs on
-# every message of every flush, so it must not stat or parse ``config.json``
-# per call, and the one-time read keeps the hot path free of config I/O the way
-# the loader's push pattern does for the event loop. A changed value therefore
-# takes effect on the next gateway restart, which the config field descriptions
-# state. ``None`` means "not resolved yet"; tests reset it via the autouse
-# cache-isolation fixture in ``test/conftest.py``.
+# once and then served from this module global: the builder runs on every
+# message of every flush, so it must not stat or parse ``config.json`` per call,
+# and the memo keeps the hot path free of config I/O the way the loader's push
+# pattern does for the event loop. The memo is INVALIDATED on a config write
+# (see ``_on_config_change``), so a changed bound takes effect on the next flush
+# rather than on the next gateway restart. ``None`` means "not resolved yet";
+# tests reset it via the autouse cache-isolation fixture in ``test/conftest.py``.
 _entry_cache_bounds_cached: tuple[int, int] | None = None
 _entry_cache_bounds_read_warned = False
+
+#: The registered bounds applier, kept so ``watch_config`` stays idempotent.
+_entry_cache_config_sub: object = None
+
+
+def _on_config_change(change: object) -> None:
+    """Drop the memoised entry-cache bounds so the next read re-resolves them.
+
+    Invalidation rather than a push, because the memo is read on the flush hot
+    path and a config write is rare: clearing it costs one assignment and the
+    next flush pays a single fingerprint-cached load. The read-failure warning
+    latch is cleared with it, so a bound that starts working again warns once
+    more instead of staying silent about a NEW failure.
+    """
+    del change  # either bound changing invalidates the same pair
+    global _entry_cache_bounds_cached, _entry_cache_bounds_read_warned
+    _entry_cache_bounds_cached = None
+    _entry_cache_bounds_read_warned = False
+
+
+def watch_config() -> None:
+    """Register the entry-cache bounds invalidator on the process config watcher."""
+    global _entry_cache_config_sub
+    if _entry_cache_config_sub is not None:
+        return
+    from kiro_crew.config import live
+
+    _entry_cache_config_sub = live.subscribe(
+        "dashboard.chat_entry_cache_max_entries",
+        "dashboard.chat_entry_cache_max_bytes",
+        callback=_on_config_change,
+        name="chat-entry-cache-bounds",
+    )
 
 
 def _entry_cache_bounds() -> tuple[int, int]:
     """Configured ``(max_entries, max_bytes)`` bounds for the entry cache.
 
     Reads the validated config once (loader-clamped to the documented ranges)
-    and memoises the pair for the process lifetime. Falls back to the built-in
-    defaults when the loaded values are not real integers (a stubbed config
+    and memoises the pair until a config write invalidates it (see
+    ``_on_config_change``). Falls back to the built-in defaults when the loaded
+    values are not real integers (a stubbed config
     object would otherwise flow a non-numeric value into the eviction
-    comparison) -- that shape is process-permanent, so it latches. A config
+    comparison) -- that shape does not change without a config write, so it
+    memoises like any other resolved pair. A config
     read that RAISES falls back to the defaults for this call WITHOUT
     latching, so a transient failure retries on the next call instead of
     discarding an operator's setting for the process lifetime; ``load()``
@@ -2875,6 +2981,14 @@ def _save_slot_to_history(
                     fields["agent"] = slot.agent
                 if slot.workspace:
                     fields["workspace"] = slot.workspace
+                # CLEARABLE, and it has to be: the merge cannot delete a key, so a
+                # crew rebound from a silo back to the default store would keep
+                # consolidating into the silo it left. The cleared spelling is ""
+                # rather than "default" so it reads as falsy everywhere -- the
+                # rehydrate mirror and the consolidator's own resolver both treat
+                # falsy as "the global store", which is also how a session written
+                # before crew stores existed reads.
+                fields["memory_store"] = named_store_or_empty(slot.memory_store)
                 if slot.project:
                     fields["project"] = slot.project
                 if slot._app:
@@ -3184,6 +3298,8 @@ def _save_slot_to_history(
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
                 meta_line["workspace"] = slot.workspace
+            if _named := named_store_or_empty(slot.memory_store):
+                meta_line["memory_store"] = _named
             if slot.project:
                 meta_line["project"] = slot.project
             # Remote-execution binding. All three are written together or not at

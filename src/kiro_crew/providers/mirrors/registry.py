@@ -15,13 +15,16 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
 )
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
+from kiro_crew.providers.mirrors.codex import CodexMirror
 
 #: Backends whose spec projection lives in this folder.
 MIRRORS: dict[str, type[AgentConfigMirror]] = {
     ACP_BACKEND_CLAUDE: ClaudeCodeMirror,
+    ACP_BACKEND_CODEX: CodexMirror,
 }
 
 #: Backends that deliberately have no mirror, and why. Read as a claim to be
@@ -43,18 +46,22 @@ NO_MIRROR: dict[str, str] = {
         "yet. Tracked as the next PR in the mirror stack; NOT a claim that it needs "
         "no mirror"
     ),
-    ACP_BACKEND_CODEX: (
-        "codex IS in BASELINE_SELECTABLE_BACKENDS, so a public build offers it and "
-        "serves sessions on it today — the mirror is simply unwritten and the shape "
-        "the adapter accepts is unverified, which is why "
-        "AcpClient._codex_session_mcp_servers still returns []. That empty array is a "
-        "real user-visible state: nothing is PROJECTED onto a codex session, and what "
-        "it does carry is decided elsewhere — _pooled_mcp_servers appends the shared "
-        "gateway's broker stubs for every backend alike, so Crew's own control plane "
-        "arrives when the overlay wrapped it and the session has no MCP tools at all "
-        "when that gateway is off. Do not shorten this to 'nothing is mounted': "
-        "unprojected does not mean absent. Listed here to keep the omission "
-        "explained; NOT a claim that it needs no mirror"
+    ACP_BACKEND_OPENCODE: (
+        "opencode is offered on a public build and serves sessions today, and its "
+        "mirror is unwritten for a reason that is not scheduling: the channel a "
+        "projection would travel down does not reach Crew's own tools. Its "
+        "initialize result advertises mcpCapabilities of http and sse and no stdio, "
+        "so the session/new mcpServers array cannot carry the stdio servers a "
+        "projection would put in it, which is why opencode is outside "
+        "ACP_BACKENDS_SESSION_MCP_ARRAY. What it reads instead is its own config "
+        "file's mcp block, and writing that would mean writing into a checked-out "
+        "repository -- the thing this harness's routing seed deliberately avoids by "
+        "travelling in the child's environment. So an opencode session carries the "
+        "shared gateway's broker stubs when _pooled_mcp_servers appends them and no "
+        "Crew tools at all when that gateway is off. Writing a mirror here needs the "
+        "transport question answered "
+        "first (an http or sse broker endpoint, or a config channel that is not the "
+        "user's repo); NOT a claim that it needs no mirror"
     ),
 }
 

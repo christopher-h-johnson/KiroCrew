@@ -12,8 +12,6 @@ src/kiro_crew/acp/kas_wire.py
 src/kiro_crew/acp/liveness.py
 src/kiro_crew/acp/session_handle.py
 src/kiro_crew/acp/worker_pool.py
-src/kiro_crew/appearance_packs/store.py
-src/kiro_crew/appearance_packs/transfer.py
 src/kiro_crew/apps/__init__.py
 src/kiro_crew/apps/app_storage.py
 src/kiro_crew/apps/backend.py
@@ -196,7 +194,6 @@ src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/memory.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
 src/kiro_crew/dashboard/handlers/security.py
-src/kiro_crew/dashboard/handlers/side.py
 src/kiro_crew/dashboard/handlers/sso_login.py
 src/kiro_crew/dashboard/handlers/steering.py
 src/kiro_crew/dashboard/handlers/terminal.py
@@ -233,7 +230,6 @@ src/kiro_crew/deploy/webapp_types.py
 src/kiro_crew/discord/attachments.py
 src/kiro_crew/doc_parser.py
 src/kiro_crew/emoji_list.py
-src/kiro_crew/env.py
 src/kiro_crew/eval/bench/adapters/longmemeval.py
 src/kiro_crew/eval/bench/corpus.py
 src/kiro_crew/eval/bench/ingest.py
@@ -362,7 +358,6 @@ test/test_acp_true_provider_error.py
 test/test_acp_turn_lock.py
 test/test_admission_gate.py
 test/test_agent_default_model.py
-test/test_agent_delete_reference_guard.py
 test/test_agent_discovery.py
 test/test_agent_import_hoist.py
 test/test_agent_source_ownership_durability.py
@@ -447,7 +442,6 @@ test/test_bench_scorers.py
 test/test_bench_windows_symlink.py
 test/test_bootstrap.py
 test/test_brand_name_gate.py
-test/test_browser_cli_launch.py
 test/test_browser_cli_snapshots.py
 test/test_browser_recording_skill.py
 test/test_bug_proposal_skip_status_default.py
@@ -558,7 +552,6 @@ test/test_dashboard_no_legacy.py
 test/test_dashboard_reset_sessions.py
 test/test_dashboard_route_table.py
 test/test_dashboard_server_coverage.py
-test/test_dashboard_sessions_clear.py
 test/test_dashboard_sessions_memory.py
 test/test_dashboard_sessions_search.py
 test/test_dashboard_start_site.py
@@ -632,7 +625,6 @@ test/test_dev_fleet_server_coverage.py
 test/test_dev_fleet_server_more_coverage.py
 test/test_diagnostics.py
 test/test_discord_client_coverage.py
-test/test_discord_config_handlers.py
 test/test_display_time_redaction.py
 test/test_doc_parser.py
 test/test_docker_entrypoint.py
@@ -693,7 +685,6 @@ test/test_history_coverage.py
 test/test_history_locking_remediation.py
 test/test_history_race.py
 test/test_hook_matcher_modes.py
-test/test_hooks.py
 test/test_hooks_json_shared_file.py
 test/test_host_isolation_floor.py
 test/test_host_service_guard.py
@@ -749,7 +740,6 @@ test/test_lesson_ranking.py
 test/test_lifecycle_hooks.py
 test/test_link_dashboard.py
 test/test_live_target.py
-test/test_llm_helpers_tool_gate.py
 test/test_llm_pool.py
 test/test_local_gate.py
 test/test_loopback_proxy.py
@@ -854,7 +844,6 @@ test/test_options_click_validation.py
 test/test_options_submit.py
 test/test_orphaned_approval_card.py
 test/test_outbox_binary.py
-test/test_outbox_notify_broadcast.py
 test/test_override_expiry_notice.py
 test/test_papyrus_gitops.py
 test/test_papyrus_latex.py
@@ -914,7 +903,6 @@ test/test_registry_hero_fields.py
 test/test_release_promotion.py
 test/test_release_promotion_contract.py
 test/test_remote_artifacts.py
-test/test_remove_slot_for_history_key.py
 test/test_resolve_session_key.py
 test/test_resolve_skill_root_package.py
 test/test_resource_health_endpoint.py
@@ -928,7 +916,6 @@ test/test_route_registry.py
 test/test_run_config_write.py
 test/test_safety_override.py
 test/test_sage_backend_routes_coverage.py
-test/test_sandbox_argv.py
 test/test_sandbox_backend_cache.py
 test/test_sandbox_default_fix.py
 test/test_sandbox_first_party_exec.py
@@ -973,7 +960,6 @@ test/test_session_usage.py
 test/test_sessions_health_cache.py
 test/test_settingref_schema_fixture.py
 test/test_ship_report_issues.py
-test/test_side.py
 test/test_side_context.py
 test/test_side_context_cov80.py
 test/test_side_steer_queue.py
@@ -1061,7 +1047,6 @@ test/test_teams_config.py
 test/test_teams_gateway.py
 test/test_telegram_album.py
 test/test_telegram_attachments.py
-test/test_telegram_config_handlers.py
 test/test_terminal_commands.py
 test/test_terminal_handler.py
 test/test_theme_authoring_skill.py
@@ -1089,7 +1074,6 @@ test/test_validation_user_actions.py
 test/test_vector_memory.py
 test/test_vector_memory_coverage.py
 test/test_vendored_llama_payload.py
-test/test_verbosity_config.py
 test/test_voice_reply.py
 test/test_wait_countdown_keepalive.py
 test/test_watchdog.py
