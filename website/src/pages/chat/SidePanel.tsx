@@ -372,6 +372,9 @@ interface SidePanelProps {
    *  page's roster column -- passes their live width so a drag can never fold
    *  the pane beside the panel to nothing. */
   extraReserveW?: number
+  /** Resting width before the user has ever dragged the handle. The chat page
+   *  keeps the built-in 460; the Crewmates page rests at 60% of its row. */
+  defaultWidth?: number
   /** Views this host WITHDRAWS from the strip: dropped from the pinned block
    *  and the + menu alike (a stored tab of such a kind is left in the bucket,
    *  just not offered). For a host that cannot feed a view's data — the
@@ -494,7 +497,7 @@ export default function SidePanel({
   pins, pinsLoading, onJumpToPin, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
-  leadingTabs, extraReserveW = 0, hiddenViews: hostHiddenViews, onActiveTabChange,
+  leadingTabs, extraReserveW = 0, defaultWidth = 460, hiddenViews: hostHiddenViews, onActiveTabChange,
 }: SidePanelProps) {
   const { tabs, activeId: storedActiveId, openView, openPanelTab, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
   // The Dynamic Dashboard is a Feature Preview (Settings > Developer). While it
@@ -733,8 +736,8 @@ export default function SidePanel({
   }
   const [widthBySlot, setWidthBySlot] = useState<Record<string, number>>({})
   const width = useMemo(
-    () => ownDim(widthBySlot, dimSlot) ?? loadSidePanelDim({ base: SIDE_PANEL_WIDTH_KEY, slot: dimSlot, min: MIN_W, fallback: 460 }),
-    [widthBySlot, dimSlot, MIN_W],
+    () => ownDim(widthBySlot, dimSlot) ?? loadSidePanelDim({ base: SIDE_PANEL_WIDTH_KEY, slot: dimSlot, min: MIN_W, fallback: defaultWidth }),
+    [widthBySlot, dimSlot, MIN_W, defaultWidth],
   )
   const setWidth = useCallback((w: number) => {
     const target = dimSlotRef.current
@@ -1929,7 +1932,7 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
         <div className="flex items-center gap-0.5 shrink-0">
           <button
             onClick={(e) => { e.stopPropagation(); onClose() }}
-            className={`shrink-0 -ml-0.5 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
+            className={`shrink-0 -ml-0.5 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70 [@media(hover:none)]:opacity-70'}`}
             title={i18nT('pages.chat.sidePanel.close_tab')}
             aria-label={i18nT('pages.chat.sidePanel.close_tab')}
           >

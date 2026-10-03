@@ -203,7 +203,7 @@ it adds:
 | `[SLACK THREAD REPLIES]` | `slack/thread_replies.py`, fenced as untrusted | a Slack thread turn with replies it has not seen |
 | `[PROJECT]` | the slot's project dir | every turn, `project` group |
 | `[BOARD]` | slot board tags, sanitized ids | slot carries tags |
-| `[RESOURCES]` | `resource_status.probe` | host memory tight/critical, or the agent slice within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max` |
+| `[RESOURCES]` | `resource_status.probe` | host memory tight/critical, or the agent slice within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, or a macOS kernel memory-pressure level of WARN or worse |
 | `[FOLDER]` | sidebar ancestry | once per session, and after a move |
 | `[THEME PERSONA]` / `$skill` bodies | `request_prefix_context` | dashboard-generated |
 | `[Skill: name]` bodies, `[Relevant skills for this message]` | trigger matching | see below |
@@ -352,7 +352,12 @@ second private window into the masked scratch root and names as the child's
 directory (its replacement inherits and adopts it). Reclamation is keyed on
 process liveness rather than on file age — a directory is removed only once its
 recorded owner's process GROUP is dead **and** the whole tree has been idle past a
-grace window, and an ownerless directory is never deleted. The seams and the
+grace window, and an ownerless directory is never deleted. On macOS the Seatbelt
+deny over the masked root re-opens `file-read-metadata` on the literal
+directories above each window (`sandbox._window_ancestors`) and nothing else:
+`realpath` of a window `lstat`s every component, so without it a harness that
+canonicalizes its `$TMPDIR` — the Copilot CLI's `session/new` — fails on its own
+directory. Siblings stay unlistable and unreadable. The seams and the
 ownership rule: [subagent](../system-specs/modules/subagent.md#one-kirocrew_scratch-per-session-tree).
 
 ## 4. Default agent vs other agents
@@ -403,12 +408,18 @@ transport protocol. MCP Tool Search discovers tool schemas, not skill bodies.
    the omitted tail. Ordinary trusted project skills also activate on demand,
    through the descriptor-confined reader rather than a mutable checkout path.
 2. **`skills.lazy_load`** (default true) selects the ranked `## Available Skills`
-   index. False selects the shorter search pointer and up to eight usage-ranked
-   names. Both use the same allowance; mapping never expands it.
-3. **Required instructions.** `always: true` bodies share an explicit 99,000-byte
-   startup capacity, including rendered headings and framing. An unavailable or
-   over-capacity required body fails context construction with an actionable error;
-   required instructions are never silently truncated or deferred.
+   index. False selects the shorter search pointer and up to eight names. Both
+   order rows the same way (the user's own skills take up to six of the first
+   eight places, the highest-ranked remaining skills fill the rest) and use the
+   same allowance; mapping never expands it.
+3. **Required instructions.** The operator's `always: true` bodies share an
+   explicit 99,000-byte startup capacity, including rendered headings and framing.
+   An unavailable or over-capacity required body fails context construction with an
+   actionable error; required instructions are never silently truncated or deferred.
+   A trusted project's `always: true` bodies have their own project skill budget
+   instead, so a checked-out repository cannot fail the session: one that does not
+   fit or cannot be read is left out with a warning, and an in-prompt notice names
+   it with its `skill_search` read pointer (within a bound; the rest are counted).
 4. **Activation.** Search considers metadata and body terms together, ranking
    overall query coverage before rarity and metadata preference. Incremental body
    indexing has a short work budget; incomplete results say so and can be retried.

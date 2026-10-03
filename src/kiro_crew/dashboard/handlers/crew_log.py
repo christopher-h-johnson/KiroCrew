@@ -1834,6 +1834,7 @@ class CrewLogPublisher:
         # newest (revision, seq, value) per (session, fold). See :meth:`_schedule_session`.
         self._pending: "dict[tuple[str, str], tuple[int, int, dict[str, Any]]]" = {}
         self._sessions_armed = False
+        self._bus_disposers: "list[Callable[[], None]]" = []
         self._slot_owners: "OrderedDict[str, str]" = OrderedDict()
         # The newest revision published per (slot, fold), which is what a connecting
         # client is handed as its floor. Written on the fold worker's thread and read on
@@ -1854,6 +1855,8 @@ class CrewLogPublisher:
         # land and be broadcast last. When a pass finishes with more work marked,
         # it schedules the next pass itself.
         self._flushing = False
+        # True while a lineage push is armed on the loop (see :meth:`_mark_tree`).
+        self._tree_scheduled = False
 
     # -- writer thread ------------------------------------------------------ #
 
@@ -1878,48 +1881,148 @@ class CrewLogPublisher:
 
     # -- fold worker thread, via the crew-log bus --------------------------- #
 
+    def subscribe_bus(self) -> None:
+        """Subscribe this publisher to the crew-log bus, replacing any earlier pair.
+
+        TWO keyed fold subscriptions, one per scope, so each handler receives only its
+        own kind of fold and the bus never hands a slot event to the session path or the
+        reverse, plus one for the session tree. The disposers are KEPT: a second install in the same process (a gateway
+        restarted inside one interpreter) disposes the old pair before subscribing the
+        new one, so this publisher is never called twice for one event.
+        """
+        # boot-path import gate: the bus is imported where the publisher is installed.
+        from kiro_crew.crew_log import bus as crew_log_bus
+
+        for dispose in self._bus_disposers:
+            dispose()
+        self._bus_disposers = [
+            crew_log_bus.subscribe(
+                crew_log_bus.FOLD_ADVANCED, self.on_slot_fold, scope=crew_log_bus.SCOPE_SLOT
+            ),
+            crew_log_bus.subscribe(
+                crew_log_bus.FOLD_ADVANCED,
+                self.on_session_fold,
+                scope=crew_log_bus.SCOPE_SESSION,
+            ),
+            # The session tree's change event: an open, a takeover, a release, a forget,
+            # or the seed landing. The sidebar's nesting is pushed from here.
+            crew_log_bus.subscribe(crew_log_bus.TREE_ADVANCED, self.on_tree_advanced),
+        ]
+
+    def unsubscribe_bus(self) -> None:
+        """Drop every bus subscription. Idempotent."""
+        disposers, self._bus_disposers = self._bus_disposers, []
+        for dispose in disposers:
+            dispose()
+
     def on_fold_advanced(self, event: Any) -> None:
-        """THE WS EXPORTER: the crew-log bus's first subscriber.
+        """Route one :class:`FoldAdvanced` to the handler for its scope.
+
+        The bus subscriptions call :meth:`on_slot_fold` and :meth:`on_session_fold`
+        directly, already filtered by scope; this is the entry for a caller holding an
+        event of either kind.
+        """
+        scope = str(getattr(event, "scope", "") or "")
+        if scope == "slot":
+            self.on_slot_fold(event)
+        elif scope == "session":
+            self.on_session_fold(event)
+
+    def on_slot_fold(self, event: Any) -> None:
+        """THE WS EXPORTER for a slot fold: one frame per event, no coalesce.
 
         Called on the crew log's FOLD WORKER thread, synchronously inside
         ``bus.publish``. Same shape and same reason as :meth:`notify`: no I/O, no lock,
         hand the frame to the loop that owns the sockets and return. The value arrives
-        already folded -- that is what an eager advance produced -- so there is nothing
-        to read.
-
-        It is a SUBSCRIBER and not a call the folder makes, so the crew log names no
-        dashboard symbol: it publishes, and this registers. Further subscribers are
-        named in ``bus``'s docstring and are not built here.
+        already folded, so there is nothing to read.
 
         NOT COALESCED, which is the folder's doing rather than an omission: it drains its
         whole queue per batch and folds each (key, fold) once, so a turn's burst reaches
         this once per fold it moved.
 
-        A SESSION fold that is not advertised (``class``) is not sent: its one reader
-        asks for it by name, and a browser cannot draw it.
-
         The event is read DEFENSIVELY -- a bus carries whatever a publisher sends, and a
         malformed one must cost this frame rather than the fan-out to the next subscriber.
         """
-        scope = str(getattr(event, "scope", "") or "")
+        unpacked = self._unpack(event)
+        loop = self._loop
+        if unpacked is None or loop is None:
+            return
+        key, fold, revision, _seq, value = unpacked
+        try:
+            self._record_revision(key, fold, revision)
+            loop.call_soon_threadsafe(self._push_fold, key, fold, revision, value)
+        except RuntimeError:
+            logger.debug("crew log fold for %s/%s arrived after the loop closed", key, fold)
+
+    def on_session_fold(self, event: Any) -> None:
+        """THE WS EXPORTER for a session fold: held for the next coalesced send.
+
+        Same thread and same contract as :meth:`on_slot_fold`. A SESSION fold that is
+        not advertised (``class``) is not sent: its one reader asks for it by name, and a
+        browser cannot draw it.
+        """
+        unpacked = self._unpack(event)
+        loop = self._loop
+        if unpacked is None or loop is None:
+            return
+        key, fold, revision, seq, value = unpacked
+        if fold not in _crew_log().PROJECTION_NAMES:
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_session, key, fold, revision, seq, value)
+        except RuntimeError:
+            logger.debug("crew log fold for %s/%s arrived after the loop closed", key, fold)
+
+    @staticmethod
+    def _unpack(event: Any) -> "tuple[str, str, int, int, dict[str, Any]] | None":
+        """``(key, fold, revision, seq, value)`` from *event*, or ``None`` if malformed."""
         key = str(getattr(event, "key", "") or "")
         fold = str(getattr(event, "fold", "") or "")
         revision = int(getattr(event, "revision", 0) or 0)
         seq = int(getattr(event, "seq", 0) or 0)
         value = getattr(event, "value", None)
+        if not key or not fold or revision <= 0 or not isinstance(value, dict):
+            return None
+        return key, fold, revision, seq, value
+
+    def on_tree_advanced(self, event: Any) -> None:
+        """The session tree moved. Called on whichever thread changed it.
+
+        That is the emitter's writer thread for an open or a takeover, so this does what
+        :meth:`notify` does: no I/O, no lock, one hop to the loop. The event carries no
+        tree -- the push re-joins the projection against the live slots on the loop.
+        """
         loop = self._loop
-        if loop is None or not key or not fold or revision <= 0 or not isinstance(value, dict):
+        if loop is None:
             return
         try:
-            if scope == "slot":
-                self._record_revision(key, fold, revision)
-                loop.call_soon_threadsafe(self._push_fold, key, fold, revision, value)
-            elif scope == "session" and fold in _crew_log().PROJECTION_NAMES:
-                loop.call_soon_threadsafe(self._schedule_session, key, fold, revision, seq, value)
+            loop.call_soon_threadsafe(self._mark_tree)
         except RuntimeError:
-            logger.debug("crew log fold for %s/%s arrived after the loop closed", key, fold)
+            logger.debug("session tree change arrived after the loop closed")
 
     # -- event loop --------------------------------------------------------- #
+
+    def _mark_tree(self) -> None:
+        """Arm ONE coalesced lineage push. On the loop.
+
+        A burst -- a lead opening six workers, a seed landing beside a turn's open -- is
+        one push after :data:`COALESCE_SECONDS`, not one per change.
+        """
+        if self._tree_scheduled or self._loop is None:
+            return
+        self._tree_scheduled = True
+        self._loop.call_later(COALESCE_SECONDS, self._push_tree)
+
+    def _push_tree(self) -> None:
+        """Send the slots whose ``parent`` moved. On the loop. Never raises."""
+        self._tree_scheduled = False
+        push = getattr(self._state, "push_lineage_patch", None)
+        if push is None:
+            return
+        try:
+            push()
+        except Exception:
+            logger.debug("session lineage push failed", exc_info=True)
 
     def _push_fold(self, slot: str, fold: str, revision: int, value: "dict[str, Any]") -> None:
         """Broadcast one folded slot value. On the loop.
@@ -2194,9 +2297,16 @@ class CrewLogPublisher:
         self._loop = loop
         if state is not None:
             self._state = state
+        tree_owed = self._tree_scheduled
         self._scheduled = False
         self._flushing = False
         self._sessions_armed = False
+        self._tree_scheduled = False
+        if tree_owed:
+            # A push armed on the retiring loop never fires; re-arm it here so a tree
+            # change that landed during the swap still reaches the new sockets.
+            self._tree_scheduled = True
+            loop.call_later(COALESCE_SECONDS, self._push_tree)
         if self._dirty:
             self._scheduled = True
             loop.call_later(COALESCE_SECONDS, self._run)
@@ -2250,19 +2360,24 @@ def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     loop = asyncio.get_running_loop()
     if _publisher is not None:
         _publisher.bind(loop, state)
+        _publisher.subscribe_bus()
         return _publisher
-    from kiro_crew.crew_log import bus as crew_log_bus
     from kiro_crew.crew_log import emit as crew_log_emit
 
     _publisher = CrewLogPublisher(state)
     _publisher.bind(loop, state)
     crew_log_emit.add_growth_listener(_publisher.notify)
-    # THE BUS SUBSCRIPTION, and the reason it is here rather than in the folder: this is
-    # the one place the dashboard state exists, so this is where a consumer of a crew-log
-    # event can be attached without the crew log naming the dashboard. Registered under
-    # the same once-per-process rule as the growth listener above -- the growth listener
-    # says a session's file moved, this says a slot's folded value moved and what it is.
-    crew_log_bus.subscribe(crew_log_bus.FOLD_ADVANCED, _publisher.on_fold_advanced)
+    # THE BUS SUBSCRIPTIONS, and the reason they are here rather than in the folder: this
+    # is the one place the dashboard state exists, so this is where a consumer of a
+    # crew-log event can be attached without the crew log naming the dashboard. The
+    # growth listener says a session's file moved; the bus says a fold's value moved and
+    # what it is, or that the session tree moved. A re-install swaps them through their
+    # disposers.
+    _publisher.subscribe_bus()
+    # The bus keeps nothing for a late subscriber, and a client can read the slot list
+    # before this line runs: its seed may already have landed and announced to nobody.
+    # One push now re-joins the tree against the live slots, so that page still nests.
+    _publisher._mark_tree()
     return _publisher
 
 

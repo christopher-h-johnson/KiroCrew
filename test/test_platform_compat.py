@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import io
 import json
 import logging
 import mmap
@@ -1033,6 +1034,77 @@ class TestUtf8Console:
         finally:
             log.removeHandler(handler)
         assert errors == []
+
+
+class _TtyTextIOWrapper(io.TextIOWrapper):
+    """A text stream that answers like a terminal and counts reconfigure calls."""
+
+    reconfigures = 0
+
+    def isatty(self) -> bool:
+        return True
+
+    def reconfigure(self, **kwargs) -> None:
+        type(self).reconfigures += 1
+        super().reconfigure(**kwargs)
+
+
+class TestLineBufferedStdout:
+    STATUS_LINE = "👻 Kiro Crew gateway starting…"
+
+    def test_status_line_reaches_a_non_tty_stdout_as_printed(self, monkeypatch):
+        # A pipe or a file (the journal under systemd, the Desktop supervisor's
+        # log fd, a detached gateway's own gateway.log) gets a block-buffered
+        # stdout, so a status line sits in the buffer until it fills or the
+        # process exits. After the gateway's stdout setup, one plain print()
+        # with no flush must already be in the underlying bytes.
+        raw = io.BytesIO()
+        # newline="\n": one byte per newline on every OS, so the compare is about buffering.
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n", line_buffering=False)
+        assert not stream.isatty()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()
+        print(self.STATUS_LINE)
+
+        assert raw.getvalue() == f"{self.STATUS_LINE}\n".encode("utf-8")
+
+    def test_a_terminal_stdout_is_left_alone(self, monkeypatch):
+        # A terminal is line-buffered by the interpreter itself; the seam must
+        # not touch it (not even a flush through reconfigure).
+        stream = _TtyTextIOWrapper(
+            io.BytesIO(), encoding="utf-8", newline="\n", line_buffering=True
+        )
+        _TtyTextIOWrapper.reconfigures = 0
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()
+
+        assert _TtyTextIOWrapper.reconfigures == 0
+        assert stream.line_buffering is True
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param(None, id="absent-pythonw"),
+            pytest.param(io.StringIO(), id="no-reconfigure"),
+            pytest.param(types.SimpleNamespace(), id="plain-object"),
+        ],
+    )
+    def test_a_stream_that_cannot_be_reconfigured_does_not_raise(self, monkeypatch, stdout):
+        # Boot must survive a replaced or captured stdout: a launcher's plain
+        # object up a multi-process spawn chain, a test's StringIO, or no
+        # stream at all. Nothing to buffer means nothing to do.
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        pc.ensure_line_buffered_stdout()  # must not raise
+
+    def test_a_closed_stdout_does_not_raise(self, monkeypatch):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", newline="\n")
+        stream.close()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        pc.ensure_line_buffered_stdout()  # must not raise
 
 
 def _wire_mapping(buf: mmap.mmap, length: int) -> bool:
@@ -2719,8 +2791,8 @@ class TestProcessDescendants:
             ),
         ]
         assert runs == [
-            ["/usr/bin/ps", "-Ao", "pid=,ppid=,lstart="],
-            ["/usr/bin/ps", "-Ao", "pid=,ppid=,lstart="],
+            ["/usr/bin/ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],
+            ["/usr/bin/ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],
         ]
 
     @pytest.mark.parametrize(
@@ -8179,3 +8251,145 @@ class TestProcSubtreePss:
     def test_pss_is_read_only_when_asked(self, monkeypatch) -> None:
         self._host(monkeypatch, {10: "Pss: 100 kB\n"}, {})
         assert pc.proc_subtree_sample(10, rss=False, jiffies=False).pss_kb == -1
+
+
+# ── memory_pressure_level: the macOS kernel memory-pressure sysctl ───────────
+#
+# Captured at import: test/conftest.py pins ``memory_pressure_level`` to None for
+# every test so no case reads a macOS runner's live level, and these cases test
+# the reader itself.
+_REAL_MEMORY_PRESSURE_LEVEL = pc.memory_pressure_level
+
+_SYSCTLBYNAME = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+)
+
+
+class _PressureLibc:
+    """A libc handle whose ``sysctlbyname`` answers one pressure level.
+
+    A real ctypes function pointer, so the reader's call through ctypes is
+    exercised and not just the Python around it. The production prototype and
+    the real sysctl are covered by the macOS-only test below.
+    """
+
+    def __init__(self, level: int, *, result: int = 0, size: int = 4) -> None:
+        self.calls: list[tuple[bytes, object, int]] = []
+
+        def _impl(name, oldp, oldlenp, newp, newlen):  # type: ignore[no-untyped-def]
+            self.calls.append((name, newp, newlen))
+            ctypes.cast(oldp, ctypes.POINTER(ctypes.c_uint32))[0] = level
+            oldlenp[0] = size
+            return result
+
+        # Held on the instance: ctypes would otherwise call a freed callback.
+        self.sysctlbyname = _SYSCTLBYNAME(_impl)
+
+
+class TestMemoryPressureLevel:
+    @pytest.fixture
+    def on_macos(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(pc, "memory_pressure_level", _REAL_MEMORY_PRESSURE_LEVEL)
+        monkeypatch.setattr(pc, "IS_MACOS", True)
+
+        def _install(handle: object) -> None:
+            monkeypatch.setattr(pc, "_darwin_sysctl_handle", lambda: handle)
+
+        return _install
+
+    @pytest.mark.parametrize(
+        "level", [pc.MEMORY_PRESSURE_NORMAL, pc.MEMORY_PRESSURE_WARN, pc.MEMORY_PRESSURE_CRITICAL]
+    )
+    def test_reads_each_kernel_level(self, on_macos, level: int) -> None:
+        libc = _PressureLibc(level)
+        on_macos(libc)
+        assert pc.memory_pressure_level() == level
+        # A read, never a write, of the documented sysctl name.
+        assert libc.calls == [(b"kern.memorystatus_vm_pressure_level", None, 0)]
+
+    def test_none_off_macos_without_touching_libc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pc, "memory_pressure_level", _REAL_MEMORY_PRESSURE_LEVEL)
+        monkeypatch.setattr(pc, "IS_MACOS", False)
+
+        def _refuse() -> object:
+            raise AssertionError("must not load libc off macOS")
+
+        monkeypatch.setattr(pc, "_darwin_sysctl_handle", _refuse)
+        assert pc.memory_pressure_level() is None
+
+    @pytest.mark.parametrize(
+        "handle",
+        [
+            pytest.param(None, id="no-libc"),
+            pytest.param(_PressureLibc(2, result=-1), id="sysctl-fails"),
+            pytest.param(_PressureLibc(2, size=8), id="wrong-size"),
+            pytest.param(_PressureLibc(0), id="zero-is-not-a-level"),
+            pytest.param(_PressureLibc(3), id="unknown-value"),
+        ],
+    )
+    def test_any_failure_reads_as_unknown(self, on_macos, handle: object) -> None:
+        on_macos(handle)
+        assert pc.memory_pressure_level() is None
+
+    def test_names(self) -> None:
+        assert pc.memory_pressure_name(pc.MEMORY_PRESSURE_WARN) == "WARN"
+        assert pc.memory_pressure_name(pc.MEMORY_PRESSURE_CRITICAL) == "CRITICAL"
+        assert pc.memory_pressure_name(None) == ""
+        assert pc.memory_pressure_name(3) == ""
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="reads the real macOS sysctl")
+    def test_the_real_sysctl_answers_a_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The production handle (built from the real libc) and the real
+        ``kern.memorystatus_vm_pressure_level``: a wrong name or size would read
+        as None here, which in production only shows as the hold quietly off."""
+        monkeypatch.setattr(pc, "memory_pressure_level", _REAL_MEMORY_PRESSURE_LEVEL)
+        monkeypatch.setattr(pc, "_darwin_libc_sysctl", None)
+        monkeypatch.setattr(pc, "_darwin_libc_sysctl_loaded", False)
+        assert pc.memory_pressure_level() in (
+            pc.MEMORY_PRESSURE_NORMAL,
+            pc.MEMORY_PRESSURE_WARN,
+            pc.MEMORY_PRESSURE_CRITICAL,
+        )
+
+    def test_a_concurrent_first_call_waits_for_the_one_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The handle is built once, under a lock, and published with both
+        prototypes declared: a second caller arriving mid-build must get the same
+        handle, never None (which the pressure reader would take for "unknown")."""
+        building = threading.Event()
+        release = threading.Event()
+        built: list[object] = []
+
+        class _Libc:
+            def __init__(self) -> None:
+                self.sysctl = types.SimpleNamespace()
+                self.sysctlbyname = types.SimpleNamespace()
+
+        def _cdll(_path: str) -> _Libc:
+            building.set()
+            assert release.wait(5.0), "the first build was never released"
+            built.append(object())
+            return _Libc()
+
+        monkeypatch.setattr(pc, "_darwin_libc_sysctl", None)
+        monkeypatch.setattr(pc, "_darwin_libc_sysctl_loaded", False)
+        monkeypatch.setattr(pc.ctypes.util, "find_library", lambda _name: "libc.fake")
+        monkeypatch.setattr(pc.ctypes, "CDLL", _cdll)
+        answers: list[object] = []
+        first = threading.Thread(target=lambda: answers.append(pc._darwin_sysctl_handle()))
+        first.start()
+        assert building.wait(5.0), "the first call never started building"
+        second = threading.Thread(target=lambda: answers.append(pc._darwin_sysctl_handle()))
+        second.start()
+        release.set()
+        first.join(5.0)
+        second.join(5.0)
+        assert len(answers) == 2 and answers[0] is answers[1] is not None
+        assert len(built) == 1
+        assert answers[0].sysctlbyname.argtypes is not None  # type: ignore[attr-defined]

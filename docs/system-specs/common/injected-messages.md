@@ -442,6 +442,38 @@ tools). `test_taskrunner_deny_notice.py` enumerates both modules' sites with
 their verdicts, pins the funnel's order and required keyword, and drives each
 deny with a provider double recording steer/reject order.
 
+**The eval harness and the subagent surface steer the same notice.**
+`eval/runner.py` answers a scenario turn's permission requests inline, audit →
+steer → reject, at three sites: the permission gate's refusal (`refusal_for`) —
+`policy`, with the gate's own reason; the harness's own path check on a
+filesystem tool (a sensitive credential path, or no path it can read from the
+input) — `policy`; and a tool the harness does not know to be read-only —
+`surface_policy`, the notice saying the harness runs tools read-only and
+offering no remediation. `eval/judge.py` denies every tool call at its one site —
+`surface_policy` (the judge runs no tools). The subagent surface denies through
+ONE funnel, `SubagentManager._reject_and_log` in `subagent.py`, called from
+`subagent_manager/run.py`; its REQUIRED `cause=` keyword is the per-site
+verdict, so a site added later has to write one or the other. The SEL row (and
+the child-denial metric) is written first. Per site in `run.py`:
+
+- the agent spec's PreToolUse gate blocked the call, and the stored hooks'
+  `deny` — `policy`, with the gate's or the hook's reason.
+- the unattended run refusing a call nothing positively authorizes (no approval
+  handler, no `parent_policy=auto`, no hook auto-approve) — `surface_policy`;
+  the notice names every tier that could still have authorized it. The
+  fail-closed answer to a backend child's request whose security context is
+  absent (`child_low_fidelity`, no approver attached) — `surface_policy`.
+- the approvers' no (the per-subagent factory, the gateway fallback, the
+  child-request approver) send no notice: the person's verdict is the truth.
+  The rejects that precede a `turn_limit` / `child_escalation_limit` bail send
+  none either: the run ends there, so no continuing turn exists for a notice to
+  correct.
+
+`test_eval_subagent_deny_notice.py` enumerates every `reject_tool(` in the two
+eval modules and every funnel call in `run.py` with its verdict, pins the
+funnel's order and required keyword, and drives each deny with a provider double
+recording steer/reject order.
+
 The recovery classification for the last two rows of the marker table above
 is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert
@@ -670,7 +702,7 @@ speech rather than as the user.
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
 | `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, **or** the macOS kernel reports memory pressure of WARN or worse (`ResourceStatus.memory_pressure_held`) while the figure reads ample or cannot be read; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skill_runtime/delivery.py` pointer renderer (`trigger_hint`) | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
 | `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 

@@ -215,7 +215,7 @@ and its one caller asks the registry for it by name.
 | `timeline` | The newest turn, lifecycle and cost MOMENTS, oldest first. Message, step and tool entries are deliberately absent: they are the bulk of a log, the page route and `tools` already serve them, and including them would make the timeline a second copy of the file. |
 | `tools` | Calls matched to completions by `call_id`: totals, per name, open calls, unmatched completions. An error is `status` in `refused`/`error`/`failed` OR `is_error` true -- two independent signals, and an absent `is_error` is not a claim that the call worked. |
 | `approvals` | Requests matched to decisions by `approval_id`: pending, decided, the decision tally, the last decision. The native permission path writes both types (`on_approval_requested` / `on_approval_decided` in the chat runner); coordinator approvals and question cards are not recorded. |
-| `subagents` | The children this session dispatched, matched to their closers by `agent_id`: per child its agent, model, outcome, duration, credits and a failure reason; plus whole-session totals, how many are still running, and how many dispatches were not retained. See below for the rules a reader has to know. |
+| `subagents` | The children this session dispatched, matched to their closers by `agent_id`: per child its agent, model, the task it was asked to do, outcome, duration, credits and a failure reason; plus whole-session totals, how many are still running, and how many dispatches were not retained. See below for the rules a reader has to know. |
 | `class` (INTERNAL -- not advertised, not pushed) | What KIND of session this log belongs to, over the log's WHOLE LIFE: the memory mode, the owning app, and whether the conversation was ever published to a channel. Each of those three is held at the most RESTRICTIVE value the log ever recorded, from the `class` object on the log's first `session/opened` plus every later `session/class` move, so a session published to a channel for one turn keeps reading as channel-published after the link is dropped -- that turn's content is still in this log. It also carries `workspace`, which folds differently because it is an IDENTITY rather than a restriction: there is no more-restrictive workspace to keep, so the FIRST one stated is held and a later different one sets `workspace_moved`, which is itself the restrictive fact -- a log whose content spans two workspaces is owned by neither. `recorded` says a class was stated at all and `complete` says the history has a beginning, and a reader deciding an authorization question refuses on either being false. The only fold whose consumer is a READER of another unit rather than a panel, which is why it is held restrictive rather than current: a fold that reported the present value would answer a question nobody asks of a log. |
 
 #### `subagents` -- the two rules a reader has to know
@@ -229,6 +229,30 @@ It deliberately does NOT emit an id list of the children still open, nor the cap
 surface listing the open children filters `by_id` for an absent `outcome` -- which is the
 same filter the list was built from, so shipping both is one fact spelled twice, and the
 copy that can go stale is the one nothing checks.
+
+Two row fields exist for the surface that rebuilds a child's CARD out of this fold after
+the dispatching process is gone, and neither is derivable from anything else in it.
+`task` is what the child was asked to do, `""` when the dispatch recorded none -- which is
+also how every log written before the field reads, so a surface draws no task line for it
+rather than an empty one. `started_ms` is the `subagent/spawned` entry's own envelope
+stamp, kept because a reader assembling ONE list out of several sessions' folds cannot
+order it by `seq_spawned` (seqs are per log) and because an age window needs a row to be
+dated. Neither is a second clock or a second record: the stamp is the log's own, and the
+task text lives nowhere else.
+
+A DISMISSED row is kept in the state and left out of the render. `subagent/dismissed` is
+neither an opener nor a closer -- it is the user clearing a card -- but this fold is what
+the panel draws, so it is the fold that has to stop offering the row; it is in `affects`
+for that reason alone. The row has to stay in the state, because a dismissal is an act the
+log does not un-record and a later closer still lands on it, and because the flag latches.
+`totals` never moves for a dismissal: what the session dispatched and what it spent are
+facts about the session, so a spend figure that fell when someone tidied the panel would be
+wrong. That makes the render's identity `spawned == len(by_id) + omitted + dismissed`, and
+`dismissed` is published for exactly that reason -- without it a reader checking the
+two-term form sees it fail the moment anyone clears a card, with no way to tell a tidied
+panel from arithmetic the fold got wrong. A dismissal naming no retained row -- the dispatch
+was omitted past the cap, or its opener never reached the file -- moves nothing: that child is
+not drawn either way, so there is nothing to stop drawing and no counter for it.
 
 A row retains only what something reads: `seq_spawned` (the render orders by it), `agent`,
 `model`, `outcome`, `ms`, `credits` and `reason`. The child's inherited `scope`, its spawn
@@ -1026,9 +1050,41 @@ per fold it moved. The bus fans out synchronously on the worker's own thread, in
 registration order, logs and skips a subscriber that raises, and retains nothing: an
 event with no subscriber is dropped, which is safe for the same reason a dropped wake is.
 The dashboard's `CrewLogPublisher` subscribes once per process, at the one place the
-dashboard state exists, so the crew log names no dashboard symbol. Further consumers --
-a summary fold over a session's events, the automatic-card sentence trigger, channel
-notifications -- are expected to subscribe the same way and are not built here.
+dashboard state exists, so the crew log names no dashboard symbol. The conductor
+pull-forward (`conductor_wake`, registered at `AutoNudgeService.start`) is the second
+subscriber: on a `work` fold's event it diffs each item's `last_report_at` against the
+board it last saw and pulls the conductor's armed work-ledger loop forward for the items
+that moved -- the event's `key` is the conductor's board, so it reads no binding.
+Further consumers -- a summary fold over a session's events, the automatic-card sentence
+trigger, channel notifications -- are expected to subscribe the same way and are not
+built here.
+
+**Subscribing: keys, disposers and a baseline.** `subscribe(kind, callback, *, scope=,
+key=, fold=, baseline=False)` returns a disposer. Calling it removes the subscription; a
+second call does nothing, and calling it from inside the callback is safe, because no
+registry lock is held while a callback runs and a publish skips a subscriber disposed
+after it was collected. The filters are the index: subscribers are stored by
+(kind, scope, key, fold) with `None` as a wildcard, so a publish looks up the at most
+eight buckets its event can match and never walks a subscriber keyed to another cell.
+An unfiltered subscription receives every event of its kind, which is how the WS
+exporter subscribes.
+
+`baseline=True` (with all three filters set) is for a consumer that joins after a fold
+already advanced. The subscription is registered FIRST, then the current value is read
+through the same read path a route serves (`read_slot_projection` or `read_projection`),
+delivered as a `FoldAdvanced`, and from then on only events with a HIGHER revision reach
+it -- the client rule, applied once in the bus. Events published during the read are
+held and replayed through that floor, so the join loses nothing and repeats nothing.
+The read runs on the subscriber's own thread: never the append path and never the fold
+worker, so a caller on an event loop calls it through `asyncio.to_thread`. A read that
+raises removes the subscription and propagates.
+
+The dashboard's `CrewLogPublisher` holds two scoped subscriptions, one per scope, and
+keeps their disposers so a second install in one process swaps the pair instead of
+doubling it. The conductor wake subscribes the same way, keyed to its board with a
+baseline: [`rfc-crew-log-wake`, amendment 2026-10-02](../../request-for-change/rfc-crew-log-wake.md)
+records the decision that the eager folder only folds and publishes, and consumers
+subscribe.
 
 **Why that needed a revision, and why `seq` could not be it.** A slot fold's `last_seq` is
 the NEWEST unit's own seq by contract, and conductor units are folded before worker units.

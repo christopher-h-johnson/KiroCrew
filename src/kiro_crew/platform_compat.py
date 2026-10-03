@@ -796,6 +796,41 @@ def ensure_utf8_console() -> None:
             pass
 
 
+def ensure_line_buffered_stdout() -> None:
+    """Make every ``print()`` reach a non-terminal stdout as it is printed.
+
+    CPython line-buffers ``sys.stdout`` only when it is attached to a terminal.
+    A pipe or a file -- the journal socket under systemd, the launchd stdout
+    file, the Desktop supervisor's log descriptor, a detached gateway's own
+    ``gateway.log`` -- gets a block buffer that drains when it fills or when
+    the interpreter exits cleanly, so a status line printed at boot surfaces
+    hours late, stamped with the stop time, or not at all after a kill or an
+    ``os.execv`` (which flushes nothing).  Switching the stream to line
+    buffering once is the single seam every status print goes through; the
+    lines themselves and their destination do not change.
+
+    A terminal is left untouched: the interpreter already line-buffers it, and
+    skipping ``reconfigure`` there spares even its flush.  ``sys.stderr`` is
+    not touched either, because CPython line-buffers it whatever it is
+    attached to, and :func:`ensure_utf8_console`'s fallback wrapper keeps it
+    that way.
+
+    Best-effort: a stream that is absent (``pythonw``), closed, or not a
+    ``TextIOWrapper`` (a test's ``StringIO``, a plain object left by a launcher
+    up a multi-process spawn chain) is left as it is.  Boot never fails over
+    its console.
+    """
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    try:
+        if stream.isatty():
+            return
+        stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # File locking
 # ---------------------------------------------------------------------------
@@ -1505,37 +1540,52 @@ def darwin_established_tcp_count(pid: int) -> int | None:
 
 _darwin_libc_sysctl: Any = None
 _darwin_libc_sysctl_loaded = False
+_darwin_libc_sysctl_lock = threading.Lock()
 
 
 def _darwin_sysctl_handle() -> Any:
-    """Cached ``libc`` handle with ``sysctl`` declared, or None when unavailable.
+    """Cached ``libc`` handle with ``sysctl`` and ``sysctlbyname`` declared, or None.
 
     Cached for the same reason as the libproc handle: the argv probe runs per
     descendant on the liveness oracle's cadence, and a fresh ``CDLL`` per call
-    would dlopen every time.
+    would dlopen every time. :func:`memory_pressure_level` reads through the
+    same handle. Built once under a lock, with both prototypes declared before
+    the handle is published and the loaded flag set last, so a concurrent first
+    call waits for the build instead of reading a half-declared handle or None.
     """
     global _darwin_libc_sysctl, _darwin_libc_sysctl_loaded
     if _darwin_libc_sysctl_loaded:
         return _darwin_libc_sysctl
-    _darwin_libc_sysctl_loaded = True
-    try:
-        path = ctypes.util.find_library("c")
-        if path is None:
-            return None
-        libc = ctypes.CDLL(path)
-        libc.sysctl.argtypes = [
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_uint,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_size_t),
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-        ]
-        libc.sysctl.restype = ctypes.c_int
-        _darwin_libc_sysctl = libc
-    except Exception:
-        _darwin_libc_sysctl = None
-    return _darwin_libc_sysctl
+    with _darwin_libc_sysctl_lock:
+        if _darwin_libc_sysctl_loaded:
+            return _darwin_libc_sysctl
+        handle: Any = None
+        try:
+            path = ctypes.util.find_library("c")
+            if path is not None:
+                libc = ctypes.CDLL(path)
+                libc.sysctl.argtypes = [
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.c_uint,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_size_t),
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                libc.sysctl.restype = ctypes.c_int
+                libc.sysctlbyname.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_size_t),
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                handle = libc
+        except Exception:
+            handle = None
+        _darwin_libc_sysctl = handle
+        _darwin_libc_sysctl_loaded = True
+        return handle
 
 
 def darwin_process_argv(pid: int) -> list[str] | None:
@@ -3396,7 +3446,7 @@ def _posix_process_snapshot() -> dict[int, _PosixProcessSnapshotRow] | None:
         return None
     try:
         output = subprocess.check_output(
-            [ps_bin, "-Ao", "pid=,ppid=,lstart="],
+            [ps_bin, "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],
             timeout=5,
             stderr=subprocess.DEVNULL,
         ).decode(errors="replace")
@@ -4575,6 +4625,30 @@ class _WindowsTreeOverflow(WindowsCleanupCapacityError):
     """A snapshot/identity bound prevented complete lineage observation."""
 
 
+class WindowsTreeDrainPending(OSError):
+    """An owned tree outlived one bounded drain pass and stays pinned for the sweep.
+
+    Not a refusal and not a lost tree. Every exact handle stays in
+    ``_PENDING_WINDOWS_TREE_CLEANUPS``, including members discovered too late in
+    the pass to be signalled yet, and
+    :func:`retry_pending_windows_process_trees` resumes the drain from the
+    members this pass already confirmed. A slow host meets it routinely: each
+    member's pass is two identity reads and two Toolhelp snapshots, so a large
+    agent tree on a loaded machine can spend the whole budget observing exits
+    that are already under way. It is an ``OSError`` so every caller that treats
+    an unconfirmed drain as a failed kill keeps doing so; a caller that only
+    reports the outcome can name it in one line instead of a traceback.
+    """
+
+    def __init__(self, *, root_pid: int, pending: int) -> None:
+        super().__init__(
+            "Windows process tree did not drain before the deadline "
+            f"(root pid {root_pid}, {pending} member(s) pending cleanup; "
+            "retained for the cleanup sweep)"
+        )
+        self.pending = pending
+
+
 class _PendingWindowsTreeCleanup:
     """One reservation, from before physical spawn through verified retirement."""
 
@@ -4810,7 +4884,10 @@ def _drain_windows_process_tree(state: _PendingWindowsTreeCleanup) -> bool:
             if pid in state.terminally_scanned:
                 continue
             if time.monotonic() >= deadline:
-                raise OSError("Windows process tree did not drain before the deadline")
+                raise WindowsTreeDrainPending(
+                    root_pid=state.root_pid,
+                    pending=len(set(state.handles) - state.terminally_scanned),
+                )
             before = _windows_process_handle_identity(handle)
             if before is None or before[0] != pid:
                 raise OSError(f"Windows process-tree identity unreadable: {pid}")
@@ -6224,8 +6301,22 @@ def process_thread_count(pid: int) -> int | None:
     return None
 
 
-def flock_owner_pid(path: str | os.PathLike) -> int | None:
+def _file_identity(target: str | os.PathLike | os.stat_result) -> os.stat_result | None:
+    """*target* itself when it is already a stat result, else ``os.stat`` of the path."""
+    if isinstance(target, os.stat_result):
+        return target
+    try:
+        return os.stat(target)
+    except OSError:
+        return None
+
+
+def flock_owner_pid(path: str | os.PathLike | os.stat_result) -> int | None:
     """PID recorded against an ``flock`` on *path*, via ``/proc/locks``.
+
+    *path* may instead be a stat result already taken of the file -- the
+    ``fstat`` of a descriptor the caller holds -- which is matched as given
+    rather than by re-resolving a name that may since point elsewhere.
 
     This is the pid that ACQUIRED the lock, which is not always a live process:
     an ``flock`` belongs to the open file description, so when the acquirer dies
@@ -6251,9 +6342,8 @@ def flock_owner_pid(path: str | os.PathLike) -> int | None:
     """
     if sys.platform != "linux":
         return None
-    try:
-        info = os.stat(path)
-    except OSError:
+    info = _file_identity(path)
+    if info is None:
         return None
     want = (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
     try:
@@ -6299,8 +6389,10 @@ def parent_pid(pid: int) -> int | None:
         return None
 
 
-def pids_holding_file(path: str | os.PathLike) -> list[int] | None:
+def pids_holding_file(path: str | os.PathLike | os.stat_result) -> list[int] | None:
     """PIDs with an open fd on *path*, matched by inode via ``/proc/*/fd``.
+
+    *path* may be a stat result instead, as for :func:`flock_owner_pid`.
 
     These are CANDIDATE OPENERS, not lock owners. Any process may open the file
     without locking it, and an inherited ``flock`` has no live owner to identify
@@ -6317,9 +6409,8 @@ def pids_holding_file(path: str | os.PathLike) -> list[int] | None:
     """
     if sys.platform != "linux":
         return None
-    try:
-        target = os.stat(path)
-    except OSError:
+    target = _file_identity(path)
+    if target is None:
         return None
     key = (target.st_dev, target.st_ino)
     holders: list[int] = []
@@ -7453,7 +7544,9 @@ def _win_open_without_following(path: str | os.PathLike) -> int:
     )
 
 
-def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) -> int:
+def open_file_no_reparse(
+    path: str | os.PathLike, *, nonblocking: bool = False, links_only: bool = False
+) -> int:
     """Open a regular FILE for reading, refusing a reparse point at the final name.
 
     The leaf counterpart to :func:`pin_directory`. ``pin_directory`` freezes the
@@ -7478,6 +7571,11 @@ def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) 
     ``nonblocking`` adds ``O_NONBLOCK`` on POSIX so a caller can reject a FIFO
     with ``fstat`` before an open waits for a writer. Regular file reads are
     unaffected. Windows has no POSIX FIFO open; its handle checks stay the same.
+
+    ``links_only`` narrows the Windows refusal to a reparse point that stands for
+    another name (:func:`win_fd_is_link`), so a regular file carrying a
+    cloud-files or dedup tag opens as the file it is. POSIX is unaffected: a
+    link is the only thing ``O_NOFOLLOW`` refuses there.
     """
     if IS_POSIX:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -7488,7 +7586,7 @@ def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) 
     fd = _win_open_without_following(path)
     try:
         attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
-        if attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+        if _win_reparse_refused(fd, attrs, links_only=links_only):
             raise OSError(errno.ELOOP, "reparse point at the final component", os.fspath(path))
         if attrs & _WIN_FILE_ATTRIBUTE_DIRECTORY:
             raise IsADirectoryError(errno.EISDIR, "is a directory", os.fspath(path))
@@ -7496,6 +7594,138 @@ def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) 
         os.close(fd)
         raise
     return fd
+
+
+#: ``CreateFileW`` arguments only :func:`win_open_no_reparse` uses. A directory is
+#: opened for ``LIST_DIRECTORY`` (data access, so it takes part in sharing) with
+#: read-only sharing; a file read-write, open-or-create, sharing read and write.
+_WIN_FILE_LIST_DIRECTORY = 0x00000001
+_WIN_FILE_SHARE_READ = 0x00000001
+_WIN_OPEN_ALWAYS = 4
+#: ``FILE_INFO_BY_HANDLE_CLASS.FileAttributeTagInfo``.
+_WIN_FILE_ATTRIBUTE_TAG_INFO = 9
+
+
+def win_fd_is_link(fd: int) -> bool:  # pragma: no cover - Windows
+    """Windows: True unless the object open on *fd* is positively not a link.
+
+    Reads the reparse tag of the opened object itself through
+    ``GetFileInformationByHandleEx(FileAttributeTagInfo)``, because ``os.fstat``
+    leaves ``st_reparse_tag`` at zero. A tag with the name-surrogate bit (a
+    symbolic link, a junction) stands for another name, as
+    :func:`lstat_is_name_surrogate` reads it from an ``lstat``; a tag without it
+    (a cloud-files placeholder, a deduplicated file) holds its own data. Fails
+    CLOSED: a tag that cannot be read counts as a link.
+    """
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    info = _AttributeTagInfo()
+    try:
+        handle = msvcrt.get_osfhandle(fd)  # type: ignore[attr-defined]
+    except OSError:
+        return True
+    if not kernel.GetFileInformationByHandleEx(
+        handle, _WIN_FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        return True
+    return bool(info.ReparseTag & _IO_REPARSE_TAG_NAME_SURROGATE)
+
+
+def _win_reparse_refused(fd: int, attributes: int, *, links_only: bool) -> bool:
+    """Whether a Windows open that did not follow a reparse point must refuse *fd*."""
+    if not attributes & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    return not links_only or win_fd_is_link(fd)
+
+
+def win_open_no_reparse(
+    path: str | os.PathLike, *, directory: bool, links_only: bool = False
+) -> int:  # pragma: no cover
+    """Windows: open the object at *path* ITSELF, never through a reparse point.
+
+    A file is opened read-write and created when absent; a directory is opened
+    for listing and must already exist. ``FILE_FLAG_OPEN_REPARSE_POINT`` opens a
+    junction or symlink at the name as itself, and the descriptor's own ``fstat``
+    then refuses it with ``ELOOP`` -- so nothing is created, read or written
+    through it. The share mode omits ``FILE_SHARE_DELETE``: while the descriptor
+    lives, the object cannot be renamed or deleted. A directory variant refuses a
+    non-directory with ``NotADirectoryError``. ``links_only`` narrows the refusal
+    to a reparse point that stands for another name, as for
+    :func:`open_file_no_reparse`. The native handle is transferred to a CRT
+    descriptor only on success; release it with ``os.close``.
+    """
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(
+        os.fspath(path),
+        _WIN_FILE_LIST_DIRECTORY if directory else _WIN_GENERIC_READ | _WIN_GENERIC_WRITE,
+        _WIN_FILE_SHARE_READ if directory else _WIN_FILE_SHARE_READ_WRITE,
+        None,
+        _WIN_OPEN_EXISTING if directory else _WIN_OPEN_ALWAYS,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            handle, (os.O_RDONLY if directory else os.O_RDWR) | getattr(os, "O_BINARY", 0)
+        )
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+    try:
+        info = os.fstat(fd)
+        if _win_reparse_refused(fd, getattr(info, "st_file_attributes", 0), links_only=links_only):
+            raise OSError(errno.ELOOP, "reparse point at the final component", os.fspath(path))
+        if directory and not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", os.fspath(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def open_create_no_reparse(path: str | os.PathLike, mode: int = 0o600) -> int:
+    """Open *path* read-write, creating it when absent, never through a link at the name.
+
+    The read-write, creating counterpart to :func:`open_file_no_reparse`, for a
+    caller that writes a file it also locks. POSIX:
+    :func:`open_create_or_existing` with ``O_NOFOLLOW``, so a link at the final
+    component is refused with ``ELOOP`` and never created through, and the open
+    is race-safe against a sibling creator. Windows:
+    :func:`win_open_no_reparse` with ``links_only``, refusing a link or junction
+    at the name with ``ELOOP`` the same way while a regular file carrying a
+    cloud-files or dedup tag still opens. Never truncates. What was opened is still the
+    caller's to check (``fstat``): a directory, FIFO or socket at the name can
+    open or fail with its own errno. Release the descriptor with ``os.close``.
+    """
+    if IS_POSIX:
+        return platform_lock_compat.open_create_or_existing(
+            path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), mode
+        )
+    return win_open_no_reparse(path, directory=False, links_only=True)
 
 
 _WIN_FILE_SHARE_READ_WRITE_DELETE = 0x00000001 | 0x00000002 | 0x00000004
@@ -9049,6 +9279,70 @@ def host_available_mib() -> int:
         mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
         return (mem[1] // _MIB_BYTES) if mem else 0
     return 0
+
+
+#: The values ``kern.memorystatus_vm_pressure_level`` answers in. XNU's handler
+#: (``bsd/kern/kern_memorystatus_notify.c``) converts its internal level through
+#: ``convert_internal_pressure_level_to_dispatch_level`` before answering, so
+#: the reading is ``NOTE_MEMORYSTATUS_PRESSURE_*`` from ``sys/event_private.h``.
+#: Those are the same numbers as libdispatch's public
+#: ``DISPATCH_MEMORYPRESSURE_NORMAL`` / ``_WARN`` / ``_CRITICAL``. The internal
+#: "urgent" level reports as WARN.
+MEMORY_PRESSURE_NORMAL = 1
+MEMORY_PRESSURE_WARN = 2
+MEMORY_PRESSURE_CRITICAL = 4
+_MEMORY_PRESSURE_NAMES = {
+    MEMORY_PRESSURE_NORMAL: "NORMAL",
+    MEMORY_PRESSURE_WARN: "WARN",
+    MEMORY_PRESSURE_CRITICAL: "CRITICAL",
+}
+_MEMORY_PRESSURE_SYSCTL = b"kern.memorystatus_vm_pressure_level"
+
+
+def memory_pressure_level() -> int | None:
+    """The macOS kernel's memory-pressure level, or ``None`` when unknown.
+
+    Answers one of :data:`MEMORY_PRESSURE_NORMAL`, :data:`MEMORY_PRESSURE_WARN`
+    or :data:`MEMORY_PRESSURE_CRITICAL`, the level Activity Monitor's
+    memory-pressure graph shows. It is the kernel's own verdict, and it LAGS
+    (docs/system-specs/modules/subagent.md gives the measurement), so it is no
+    measure of available memory and cannot replace a figure such as
+    :func:`host_available_mib`. A caller uses it as a backstop
+    beside such a figure: when the kernel does say WARN, the host is short
+    whatever the page counters add up to.
+
+    ``None`` everywhere other than macOS, and on any failure: no ``libc``, a
+    failed call, a wrong-size answer, or a value that is not one of the three
+    levels. A caller treats ``None`` as "no reading" and fails
+    open, the same contract as ``host_available_mib``'s 0.
+
+    Reads in-process through the cached :func:`_darwin_sysctl_handle`, with no
+    ``sysctl`` subprocess, for the reason given in :func:`macos_vm_statistics`.
+    On macOS the sysctl needs no privilege; XNU checks one only on other Apple
+    platforms.
+    """
+    if not IS_MACOS:
+        return None
+    libc = _darwin_sysctl_handle()
+    if libc is None:
+        return None
+    level = ctypes.c_uint32(0)
+    size = ctypes.c_size_t(ctypes.sizeof(level))
+    try:
+        result = libc.sysctlbyname(
+            _MEMORY_PRESSURE_SYSCTL, ctypes.byref(level), ctypes.byref(size), None, 0
+        )
+    except (OSError, ValueError, ctypes.ArgumentError):
+        return None
+    if result != 0 or size.value != ctypes.sizeof(level):
+        return None
+    value = int(level.value)
+    return value if value in _MEMORY_PRESSURE_NAMES else None
+
+
+def memory_pressure_name(level: int | None) -> str:
+    """``"NORMAL"`` / ``"WARN"`` / ``"CRITICAL"`` for *level*, ``""`` when unknown."""
+    return _MEMORY_PRESSURE_NAMES.get(level, "") if level is not None else ""
 
 
 # ---------------------------------------------------------------------------

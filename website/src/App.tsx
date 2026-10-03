@@ -876,6 +876,7 @@ export default function App() {
   const activeSlotProject = useAppSelector(selectActiveSlotProject)
   const terminalPosition = useTerminalPosition()
   const navigate = useNavigate()
+  const mayLeaveForErrorHandoff = useMayLeaveForNavigation()
 
   // Main-dashboard role for the artifact popout nav-intent handshake: perform
   // navigation intents forwarded from popout windows (activity-timeline
@@ -892,10 +893,12 @@ export default function App() {
     )
   }, [isPopout, isEmbed, navigate, dispatch])
 
-  // Publish the router navigator for the error → agent hand-off. AskAgentButton
-  // is deliberately hook-free (its callers include ErrorBoundary fallbacks, where
-  // router context may be what threw), so it navigates through this seam and
-  // falls back to a full page load when nothing is installed.
+  // Publish the router navigator and the current page's leave answer for the
+  // error → agent hand-off. AskAgentButton is deliberately hook-free (its
+  // callers include ErrorBoundary fallbacks, where router context may be what
+  // threw), so it navigates through this seam and falls back to a full page
+  // load when nothing is installed. The guard runs before prompt staging, so a
+  // veto leaves both the page and the hand-off queue untouched.
   //
   // Popout and embed windows never register, for the same reason the nav-intent
   // handler above skips them: routing THAT window to /chat would replace the
@@ -903,9 +906,9 @@ export default function App() {
   // banners of its own). They fall through to the hard-nav path instead.
   useEffect(() => {
     if (isPopout || isEmbed) return
-    installSoftNavigate(navigate)
+    installSoftNavigate(navigate, mayLeaveForErrorHandoff)
     return () => installSoftNavigate(null)
-  }, [isPopout, isEmbed, navigate])
+  }, [isPopout, isEmbed, navigate, mayLeaveForErrorHandoff])
 
   const {
     colorTheme,
@@ -970,10 +973,11 @@ export default function App() {
   // (the native dashboard); a non-null id means a remote instance's embedded
   // dashboard is shown instead, so the Local pane is hidden (not unmounted).
   const activeInstanceId = useAppSelector(s => s.instances.activeId)
+  const { macFullscreen, macInset, topReservePx } = useMacFullscreen()
   const {
     focusMode, toggleFocusMode, focusActive, topPeek, railPeek, topPeekTrigger, topPeekSurface,
     railPeekTrigger, railPeekSurface, topChromeShown, localHeaderDragGaps,
-  } = useFocusChrome({ isMobile, navCollapsed, activeInstanceId })
+  } = useFocusChrome({ isMobile, navCollapsed, activeInstanceId, topReservePx })
   // Whether the shell's one-shot entrance animation has already played.
   //
   // The local pane is HIDDEN, not unmounted, while a remote instance tab is
@@ -1267,7 +1271,6 @@ export default function App() {
   const { kiroUsageOpen, setKiroUsageOpen, kiroUsageState, kiroCreditSurface, kiroAccountEntry, refetchKirocrewCfg } = useKiroUsageReadout()
   const metrics = useMetricsReadout(isMobile, updateAvailable)
   const { capsuleCollapsed, setCapsuleCollapsed, capsuleLayoutPulse, pulseCapsuleLayout, sysMetrics, metricsProbeRef, metricsGroupRef } = metrics
-  const { macFullscreen, macInset } = useMacFullscreen()
 
   const { devMode, devPageSeen } = useDeveloperMode(location.pathname)
   // Native app-menu navigation (Settings…, About) and the Crew Companion's "Open
@@ -1641,7 +1644,9 @@ export default function App() {
        which hides the bottom row (the chat composer) on phones.
        w-full, not w-screen: 100vw resolves independently of layout, so it can
        disagree with the `(max-width: 767px)` query this shell branches on. */
-    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg">
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg"
+      data-testid="app-frame"
+      style={topReservePx ? { paddingTop: topReservePx } : undefined}>
       {/* Embedded remote panes receive their switcher model from the parent via
           this bridge (option B) — no-op in the top-level dashboard. */}
       <EmbeddedHostBridge />

@@ -443,6 +443,24 @@ _lineage_seed_in_flight = False
 _lineage_failure_warned = False
 
 
+def _new_card_store(state: Any) -> Any:
+    """*state*'s dynamic-card store, constructed on first use. THE one constructor.
+
+    A module-level function rather than a method, because both callers need it and one of them
+    (``set_dynamic_cards_enabled``) is exercised against bare stub objects that carry only
+    ``_dynamic_cards`` -- a sibling method call would not resolve on those.
+
+    The import stays INSIDE the function: it is the deferred one that keeps the card lifecycle
+    off the gateway's boot stack, and a test asserts the module is not imported until a caller
+    actually needs a store.
+    """
+    if state._dynamic_cards is None:
+        from kiro_crew.dashboard.card_lifecycle import CardLifecycle
+
+        state._dynamic_cards = CardLifecycle(state)
+    return state._dynamic_cards
+
+
 def _attach_slot_parents(
     rows: "list[dict]", resolve_aliases: "Callable[[], dict[str, str] | None] | None" = None
 ) -> None:
@@ -474,21 +492,19 @@ def _attach_slot_parents(
     still disk, and disk on this loop stalls every other request and the heartbeat
     behind it.
 
-    It does NOT broadcast when the seed lands, and that is deliberate. Every path that
-    would -- ``push_slots_update``, the trailing timer, a frame of its own -- either
-    writes the coalescer's clock or adds a frame, and both are load-bearing elsewhere: a
-    request inside ``suspend_slots_push`` needs that window open so its own flush
-    broadcasts INLINE and a broadcast failure reaches its caller, and the create path
-    pins exactly one coalesced frame per change.
+    The seed landing does not broadcast a slots frame. Every path that would --
+    ``push_slots_update``, the trailing timer -- writes the coalescer's clock, and that
+    is load-bearing elsewhere: a request inside ``suspend_slots_push`` needs that window
+    open so its own flush broadcasts INLINE and a broadcast failure reaches its caller,
+    and the create path pins exactly one coalesced frame per change.
 
     Instead the frame SAYS it is provisional: while the projection is not seeded for this
-    store, every row carries ``lineage_pending: true``, and a client that sees it reads
-    the slot list again shortly. That keeps the recovery on the read side, where it costs
-    neither contract, and it closes the case a "next ordinary broadcast" cannot: an IDLE
-    gateway, where nothing is running and no further frame is coming, so an unnested cold
-    start would otherwise persist until the user happened to act. The flag is set only
-    when a later read would genuinely answer differently -- never with the crew log off,
-    and never after a failure this cannot promise will clear.
+    store, every row carries ``lineage_pending: true``. When the seed lands, the
+    projection announces it on the crew-log bus and :meth:`DashboardState.push_lineage_patch`
+    sends the settled rows as a ``slot_patch`` -- a frame outside the coalescer -- so an
+    IDLE gateway, where no other frame is coming, still nests without a client asking
+    again. The flag is set only when a later answer would genuinely differ -- never with
+    the crew log off, and never after a failure this cannot promise will clear.
 
     Nor is the seed started at boot, which would close that one-frame window: seeding is
     bound to one store and re-runs when the data home changes, so a process serving
@@ -569,8 +585,7 @@ def _attach_slot_parents(
             # the real one. Without it a cold start is indistinguishable from a store
             # with no lineage at all, and an idle sidebar -- nothing running, no frame
             # coming -- paints unnested and stays that way until the user happens to act.
-            # The seed does not broadcast when it lands (see above), so the recovery has
-            # to be a READ the client chooses to repeat, not a frame this pushes.
+            # The seed's announcement pushes the settled rows (see above).
             pending = True
     except Exception:
         # Reached only by a genuine failure. The crew log being off returns above, so
@@ -2793,6 +2808,8 @@ class _ChatSlot:
         "_pending_subagent_failures",
         "_pending_synthesis",
         "_synthesis_inflight",
+        "_synthesis_recheck",
+        "_synthesis_rechecks",
         "_subagent_deliveries_inflight",
         "_subagents_inline_collected",
         "_subagent_delivery_pending",
@@ -2838,6 +2855,11 @@ class _ChatSlot:
         "_last_turn_structural_terminal_loop_gen",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
+        "_session_not_found_retry_used",
+        "_session_not_found_queue_id",
+        "_session_not_found_stop_gen",
+        "_session_not_found_session_stop_gen",
+        "_session_not_found_session_key",
         "_empty_response_retries",
         "_empty_episode_productive",
         "_carried_ttft_clock",
@@ -2911,6 +2933,8 @@ class _ChatSlot:
         "_turn_channel_narrowed",
         "_steer_admissions",
         "_steer_decision_strips",
+        "_steer_possibly_delivered",
+        "_steer_rpc_in_flight",
         "_steer_audience_fences",
         "_steer_audience_fence_holders",
         "_steer_attachment_meta",
@@ -3507,6 +3531,10 @@ class _ChatSlot:
         # Kept separate from _pending_synthesis so readiness loss does not
         # consume the one-shot request or permit duplicate waiters.
         self._synthesis_inflight: bool = False
+        # The fire gate's outage re-check (chat_runner._arm_synthesis_recheck):
+        # its pending timer, cancelled by begin_close, and how many it ran.
+        self._synthesis_recheck: asyncio.TimerHandle | None = None
+        self._synthesis_rechecks: int = 0
         # Fix 2 (B1) race guard: number of sub-agent completion deliveries
         # currently in flight for this slot (incremented in gateway._subagent_done
         # from entry until the completion is queued/launched). The synthesis
@@ -3738,6 +3766,19 @@ class _ChatSlot:
         # outage gets at most one fresh-conversation attempt, never a
         # discard loop.
         self._poisoned_reset_used: bool = False
+        # One-shot guard for the lost-backend-session recovery: a live backend
+        # answering 'Session not found' gets ONE fresh process that re-loads the
+        # mapped id and one retry of the turn. Re-armed only by a LANDED turn,
+        # so a backend that keeps losing the session ends on a clear error.
+        self._session_not_found_retry_used: bool = False
+        # The queued replay of that recovery, and the Stop counters and session
+        # binding it was enqueued under. The reset between enqueue and dispatch
+        # is awaited, so a soft Stop can land there with the queue preserved;
+        # the drain and the consume seam compare these to veto the replay.
+        self._session_not_found_queue_id: str = ""
+        self._session_not_found_stop_gen: int = 0
+        self._session_not_found_session_stop_gen: int = 0
+        self._session_not_found_session_key: str = ""
         self._empty_response_retries: int = 0
         # True once any turn of the CURRENT empty-turn episode was productive.
         self._empty_episode_productive: bool = False
@@ -4096,6 +4137,16 @@ class _ChatSlot:
         # outcome a decision did choose lands as a queue entry with no receipt.
         # Absent for a manual steer, which has none to carry.
         self._steer_decision_strips: dict[str, dict] = {}
+        # Steers whose RPC died ambiguously (``AcpProcessDied.ambiguous_delivery``):
+        # the frame may already have reached the turn. Left pending, so the
+        # turn's teardown requeues them, and that requeue says they may already
+        # have been delivered instead of re-sending the text as fresh.
+        self._steer_possibly_delivered: set[str] = set()
+        # Steers whose ``client.steer()`` RPC has not returned yet. A turn that
+        # ends meanwhile requeues them as possibly delivered: the frame may
+        # already be in the pipe, and the RPC's own verdict arrives too late to
+        # mark an entry the drain may already have run.
+        self._steer_rpc_in_flight: set[str] = set()
         # Admission snapshots of the peer steers that influenced THIS turn, keyed by
         # an opaque token. The turn consults them before publishing its CROSS-SURFACE
         # reply leg and withholds it when a constraint newly holds:
@@ -4218,6 +4269,9 @@ class _ChatSlot:
         the fence stays up until the last retraction lets go.
         """
         self._closing += 1
+        if self._synthesis_recheck is not None:
+            self._synthesis_recheck.cancel()
+            self._synthesis_recheck = None
 
     def cancel_close(self) -> None:
         """Release THIS holder's admission fence when teardown leaves the slot live.
@@ -6842,6 +6896,7 @@ class DashboardState:
         update_min_version: str = "",
         update_can_arm: bool = False,
         update_auto_effect: str = "unknown",
+        update_bundled_by_app: bool = False,
         version_display: str = "",
         bundle_id: str = "",
     ) -> dict[str, Any]:
@@ -6936,6 +6991,9 @@ class DashboardState:
             # What an available update leads to on this install; see
             # ``update_capability.auto_update_effect``.
             "update_auto_effect": update_auto_effect,
+            # Whether the desktop app bundles this gateway; see
+            # ``update_capability.bundled_by_desktop_app``.
+            "update_bundled_by_app": update_bundled_by_app,
             "update_last_checked_at": update_last_checked_at,
             "update_check_interval_secs": update_check_interval_secs,
             # Mandatory-update verdict (enterprise governance pin OR the release
@@ -9205,6 +9263,9 @@ class DashboardState:
         # suspenders on ``__new__``-built states that never ran __init__:
         # treat a missing set as empty rather than AttributeError-ing this hot
         # path.
+        # circular import: chat_utils imports this module at load time.
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
         under_construction = getattr(self, "_slots_under_construction", None) or ()
         for s in self._slots.values():
             if s.key in under_construction:
@@ -9215,7 +9276,9 @@ class DashboardState:
                 include_check_status=include_check_status,
                 dashboard_user=dashboard_user,
             )
-            d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
+            d["subagents_running"] = bool(
+                subs and subs.running_agents_for(effective_session_key(s))
+            )
             out.append(d)
         # The slot-key/session-key correspondence the lineage join needs, read the same
         # way ``/api/sessions/memory`` reads it for the Sessions table. Handed over
@@ -10017,6 +10080,48 @@ class DashboardState:
                 patch[field] = row[field]
         self._send_slot_patch({"slots": [patch]})
 
+    def push_lineage_patch(self) -> None:
+        """Push every live slot whose ``parent`` moved, as one ``slot_patch`` frame.
+
+        The session tree's change event lands here (see ``CrewLogPublisher``), so the
+        sidebar nests a worker the moment its crew log says who opened it -- and un-nests
+        it the moment that creator closes or releases it -- without re-reading the slot
+        list. Each row carries ``parent`` and ``lineage_pending`` and nothing else, the
+        same two values a full frame computes for it through
+        :func:`_attach_slot_parents`, so a patch and a full frame never disagree.
+
+        Rows whose two values match what this method last sent are left out, which is
+        what makes an idle tree -- or a burst that moved nothing visible -- cost no
+        frame. The memory is pruned to the live keys on each pass.
+        """
+        under_construction = getattr(self, "_slots_under_construction", None) or ()
+        rows: list[dict[str, Any]] = [
+            {"key": k} for k in list(self._slots) if k not in under_construction
+        ]
+        if not rows:
+            return
+        _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
+        sent = getattr(self, "_lineage_sent", None)
+        if sent is None:
+            sent = {}
+            self._lineage_sent = sent
+        live = {row["key"] for row in rows}
+        for key in [k for k in sent if k not in live]:
+            del sent[key]
+        changed: list[dict[str, Any]] = []
+        for row in rows:
+            value = (row.get("parent"), bool(row.get("lineage_pending")))
+            if sent.get(row["key"]) == value:
+                continue
+            sent[row["key"]] = value
+            changed.append({"key": row["key"], "parent": value[0], "lineage_pending": value[1]})
+        if not changed:
+            return
+        if self._has_legacy_slots_audience():
+            self.push_slots_update(legacy_only=True)
+        if self._has_slot_patch_clients():
+            self._send_slot_patch({"slots": changed})
+
     def push_slot_removed(self, key: str) -> None:
         """Publish that slot *key* left the registry without re-sending the list.
 
@@ -10042,10 +10147,23 @@ class DashboardState:
                 live = getattr(self._slots[key], "_dashboard_card_identity", None)
                 if entry is not None and entry.owner != live:
                     self._dynamic_cards.publisher.forget(key)
+                # A DERIVED card is retired on exactly the same rule and for exactly the
+                # same reason: it was built for the closed transcript, so it goes with it
+                # rather than being presented by the replacement as its own.
+                held = self._dynamic_cards.derived.get(key)
+                if held is not None and held["owner"] != live:
+                    self._dynamic_cards.forget_derived(key)
             self.push_slots_update()
             return
         if self._dynamic_cards is not None:
             self._dynamic_cards.publisher.forget(key)
+            self._dynamic_cards.forget_derived(key)
+            # The retirement STAMP goes with the slot too. It is kept so a write arriving after a
+            # removal can still be ordered against it, and a slot that is definitively gone has
+            # no later write to order -- so keeping it past this point retains one string per
+            # slot the gateway ever hosted, for nothing. This is the only place that knows the
+            # removal is definitive rather than a replacement.
+            self._dynamic_cards.forget_retired(key)
         if self._has_legacy_slots_audience():
             self.push_slots_update(legacy_only=True)
         if self._has_slot_patch_clients():
@@ -10074,15 +10192,33 @@ class DashboardState:
         """Serialize one ``slot_patch`` frame and hand it to patch-capable sockets."""
         _websocket_for(self).send_ws_slot_patch(json.dumps({"type": "slot_patch", "data": data}))
 
+    def ensure_dynamic_card_store(self) -> Any:
+        """The card store, constructed if absent, with the MODEL path left off.
+
+        Delegates to the module-level :func:`_new_card_store` rather than sharing a method with
+        :meth:`set_dynamic_cards_enabled`, because that method is exercised against bare stub
+        objects carrying only ``_dynamic_cards`` -- a sibling method call would fail on them,
+        and the deferred-import assertion those tests make is about WHEN the import happens,
+        which a module-level function keeps true for both callers.
+
+        A derived card -- one the product assembles from a fold it already keeps -- costs no
+        call and spends nothing from the model path's hourly budget, so it is deliberately not
+        gated on the owner's opt-in to that cost. Constructing the container only inside
+        :meth:`set_dynamic_cards_enabled` would make a free card's availability depend on
+        TOGGLE HISTORY: never enabled means no store and therefore no card, while
+        enabled-once-then-off leaves a store behind and the card appears. Same feature,
+        opposite answers, decided by a switch neither answer is about.
+
+        Constructing it here with ``enabled`` untouched keeps the model path exactly as opt-in
+        as it was: no worker is started and no attempt is spent by existing.
+        """
+        return _new_card_store(self)
+
     def set_dynamic_cards_enabled(self, enabled: bool) -> None:
         """Post-bind activation; retain the producer and its budgets across toggles."""
-        if self._dynamic_cards is None:
-            if not enabled:
-                return
-            from kiro_crew.dashboard.card_lifecycle import CardLifecycle
-
-            self._dynamic_cards = CardLifecycle(self)
-        self._dynamic_cards.set_enabled(enabled)
+        if self._dynamic_cards is None and not enabled:
+            return
+        _new_card_store(self).set_enabled(enabled)
 
     def notify_dashboard_card(self, slot: "_ChatSlot", reason: str) -> None:
         """Queue semantic work from a real event, never from a read/serialize."""
